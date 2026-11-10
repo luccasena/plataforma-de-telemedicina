@@ -30,6 +30,10 @@ def exibir_finalizacao():
         st.error("Não foi possível carregar as consultas em andamento.")
         return
 
+    if not consultas:
+        st.info("Sem consultas a serem finalizadas.")
+        return
+
     st.write(f"**Consultas em andamento:** {len(consultas)}")
 
     for consulta in consultas:
