@@ -116,6 +116,34 @@ class ProntuarioService:
             )
         )
 
+    def finalizar_consulta(self, paciente_id, consulta_id, arquivo):
+        laudo = {
+            "nome_arquivo": arquivo.name,
+            "tipo_arquivo": arquivo.type,
+            "arquivo": arquivo.getvalue(),
+            "tamanho_bytes": arquivo.size,
+            "data_upload": datetime.now(timezone.utc),
+            "descricao": "Laudo de finalização da consulta",
+        }
+        resultado = self.banco.get_collection("prontuarios").update_one(
+            {
+                "paciente_id": paciente_id,
+                "consultas": {
+                    "$elemMatch": {"_id": consulta_id, "status": "Em andamento"}
+                },
+            },
+            {
+                "$set": {
+                    "consultas.$[consulta].status": "Concluído",
+                    "consultas.$[consulta].data_finalizacao": datetime.now(timezone.utc),
+                    "data_atualizacao": datetime.now(timezone.utc),
+                },
+                "$push": {"consultas.$[consulta].exames_laudos": laudo},
+            },
+            array_filters=[{"consulta._id": consulta_id}],
+        )
+        return resultado.matched_count > 0
+
     def obter_prontuario_por_paciente(self, paciente_id):
         prontuario = self.banco.get_collection("prontuarios").find_one(
             {"paciente_id": paciente_id}
