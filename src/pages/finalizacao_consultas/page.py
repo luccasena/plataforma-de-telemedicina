@@ -6,6 +6,15 @@ from services.prontuario_service import ProntuarioService
 prontuario_service = ProntuarioService(obter_banco_mongodb())
 
 def _finalizar_consulta(paciente_id, consulta_id, arquivo):
+    if arquivo is None:
+        st.error("Anexe o laudo médico para finalizar a consulta.")
+        return
+
+    limite_bytes = 16 * 1024 * 1024
+    if arquivo.size > limite_bytes:
+        st.error("O laudo não pode ultrapassar 16 MB.")
+        return
+
     try:
         finalizada = prontuario_service.finalizar_consulta(
             paciente_id,
