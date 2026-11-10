@@ -1,9 +1,9 @@
 """
 Seed da plataforma de telemedicina (MongoDB + Neo4j).
 
-1. MongoDB: cria (ou atualiza) as coleções pacientes, profissionais,
-   prontuarios e agendamentos com validação $jsonSchema, cria os índices e
-   insere dados de exemplo.
+1. MongoDB: cria (ou atualiza) as coleções pacientes, usuarios, prontuarios e
+   agendamentos com validação $jsonSchema, cria os índices e insere dados de
+   exemplo. A coleção usuarios reúne médicos e recepcionistas.
 2. Neo4j: lê o que está no MongoDB (a fonte da verdade) e monta o grafo de
    histórico epidemiológico e interações clínicas:
 
@@ -44,6 +44,7 @@ STATUS_AGENDAMENTO = [
     "cancelado",
     "nao_compareceu",
 ]
+STATUS_CONSULTA = ["Agendado", "Em andamento", "Concluído"]
 
 # --------------------------------------------------------------------------
 # Esquemas de validação
@@ -86,20 +87,39 @@ VALIDADORES = {
         },
         obrigatorios=["nome", "cpf", "telefone", "email", "status"],
     ),
-    "profissionais": esquema(
-        {
-            "nome": TEXTO,
-            "cpf": TEXTO,
-            "crm": TEXTO,
-            "uf_crm": TEXTO,
-            "telefone": INTEIRO,
-            "email": TEXTO,
-            "especialidades": LISTA_DE_TEXTO,
-            "status": {"enum": STATUS_CADASTRO},
-            "data_cadastro": DATA,
-        },
-        obrigatorios=["nome", "cpf", "crm", "telefone", "email", "status"],
-    ),
+    "usuarios": {
+        "$jsonSchema": {
+            "bsonType": "object",
+            "properties": {
+                "nome": TEXTO,
+                "cpf": TEXTO,
+                "cargo": {"enum": ["Medico", "Recepcionista"]},
+                "crm": TEXTO,
+                "uf_crm": TEXTO,
+                "telefone": INTEIRO,
+                "email": TEXTO,
+                "senha": TEXTO,
+                "especialidades": LISTA_DE_TEXTO,
+                "status": {"enum": STATUS_CADASTRO},
+                "data_cadastro": DATA,
+            },
+            "required": [
+                "nome",
+                "cpf",
+                "cargo",
+                "telefone",
+                "email",
+                "senha",
+                "status",
+            ],
+            "oneOf": [
+                {"properties": {"cargo": {"enum": ["Medico"]}}, "required": ["crm"]},
+                {
+                    "properties": {"cargo": {"enum": ["Recepcionista"]}},
+                },
+            ],
+        }
+    },
     "prontuarios": esquema(
         {
             "paciente_id": ID,
@@ -111,7 +131,19 @@ VALIDADORES = {
                     "sintomas": LISTA_DE_TEXTO,
                     "diagnosticos": LISTA_DE_TEXTO,
                     "observacoes": TEXTO,
-                }
+                    "status": {"enum": STATUS_CONSULTA},
+                    "exames_laudos": lista_de(
+                        {
+                            "nome_arquivo": TEXTO,
+                            "tipo_arquivo": TEXTO,
+                            "arquivo": {"bsonType": "binData"},
+                            "tamanho_bytes": INTEIRO,
+                            "data_upload": DATA,
+                            "descricao": TEXTO,
+                        }
+                    ),
+                },
+                obrigatorios=["_id", "medico_id", "status"],
             ),
             "prescricoes": lista_de(
                 {
@@ -120,16 +152,6 @@ VALIDADORES = {
                     "frequencia": TEXTO,
                     "orientacoes": TEXTO,
                 }
-            ),
-            "exames_laudos": lista_de(
-                {
-                    "nome_arquivo": TEXTO,
-                    "consulta_id": ID,
-                    "tipo_arquivo": TEXTO,
-                    "arquivo": {"bsonType": "binData"},
-                    "descricao": TEXTO,
-                },
-                obrigatorios=["consulta_id"],
             ),
             "data_atualizacao": DATA,
         },
@@ -148,9 +170,14 @@ VALIDADORES = {
 
 INDICES = {
     "pacientes": [IndexModel([("cpf", ASCENDING)], unique=True)],
-    "profissionais": [
+    "usuarios": [
         IndexModel([("cpf", ASCENDING)], unique=True),
-        IndexModel([("crm", ASCENDING), ("uf_crm", ASCENDING)], unique=True),
+        IndexModel([("email", ASCENDING)], unique=True),
+        IndexModel(
+            [("crm", ASCENDING), ("uf_crm", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"cargo": "Medico"},
+        ),
     ],
     "prontuarios": [
         IndexModel([("paciente_id", ASCENDING)], unique=True),
@@ -216,14 +243,16 @@ PACIENTES = {
     },
 }
 
-PROFISSIONAIS = {
+MEDICOS = {
     "joao": {
         "nome": "Dr. João Pedro Almeida",
         "cpf": "82634512070",
+        "cargo": "Medico",
         "crm": "123456",
         "uf_crm": "SP",
         "telefone": 5511976543210,
         "email": "joao.almeida@example.com",
+        "senha": "senha123",
         "especialidades": ["Clínica Médica", "Neurologia"],
         "status": "Ativo",
         "data_cadastro": dia(2025, 10, 1),
@@ -231,14 +260,29 @@ PROFISSIONAIS = {
     "fernanda": {
         "nome": "Dra. Fernanda Ribeiro",
         "cpf": "46172839005",
+        "cargo": "Medico",
         "crm": "654321",
         "uf_crm": "RJ",
         "telefone": 5521987001122,
         "email": "fernanda.ribeiro@example.com",
+        "senha": "senha123",
         "especialidades": ["Cardiologia"],
         "status": "Ativo",
         "data_cadastro": dia(2025, 12, 10),
     },
+}
+
+RECEPCIONISTAS = {
+    "beatriz": {
+        "nome": "Beatriz Martins",
+        "cpf": "28749613004",
+        "cargo": "Recepcionista",
+        "telefone": 5511987654321,
+        "email": "beatriz.martins@example.com",
+        "senha": "senha123",
+        "status": "Ativo",
+        "data_cadastro": dia(2026, 1, 5),
+    }
 }
 
 
@@ -263,6 +307,21 @@ def montar_prontuarios(pacientes, medicos):
                     "sintomas": ["Cefaleia pulsátil", "Fotofobia", "Náusea"],
                     "diagnosticos": ["Enxaqueca sem aura (CID G43.0)"],
                     "observacoes": "Paciente alérgica a dipirona. Solicitado hemograma.",
+                    "status": "Agendado",
+                    "exames_laudos": [
+                        {
+                            "nome_arquivo": "hemograma_ana.txt",
+                            "tipo_arquivo": "text/plain",
+                            "arquivo": laudo_texto(
+                                "HEMOGRAMA COMPLETO\n"
+                                "Hemoglobina: 13,5 g/dL (ref. 12,0-15,5)\n"
+                                "Leucócitos: 6.800/mm3 (ref. 4.000-11.000)\n"
+                                "Plaquetas: 250.000/mm3 (ref. 150.000-450.000)\n"
+                                "Conclusão: sem alterações.\n"
+                            ),
+                            "descricao": "Hemograma completo sem alterações",
+                        }
+                    ],
                 }
             ],
             "prescricoes": [
@@ -271,21 +330,6 @@ def montar_prontuarios(pacientes, medicos):
                     "dosagem": "750 mg",
                     "frequencia": "De 8 em 8 horas, se dor",
                     "orientacoes": "Não exceder 4 comprimidos por dia.",
-                }
-            ],
-            "exames_laudos": [
-                {
-                    "nome_arquivo": "hemograma_ana.txt",
-                    "consulta_id": consulta_ana,
-                    "tipo_arquivo": "text/plain",
-                    "arquivo": laudo_texto(
-                        "HEMOGRAMA COMPLETO\n"
-                        "Hemoglobina: 13,5 g/dL (ref. 12,0-15,5)\n"
-                        "Leucócitos: 6.800/mm3 (ref. 4.000-11.000)\n"
-                        "Plaquetas: 250.000/mm3 (ref. 150.000-450.000)\n"
-                        "Conclusão: sem alterações.\n"
-                    ),
-                    "descricao": "Hemograma completo sem alterações",
                 }
             ],
             "data_atualizacao": agora,
@@ -300,6 +344,20 @@ def montar_prontuarios(pacientes, medicos):
                     "sintomas": ["Palpitação", "Dispneia aos esforços"],
                     "diagnosticos": ["Hipertensão arterial sistêmica (CID I10)"],
                     "observacoes": "PA 150x95 mmHg. Solicitado eletrocardiograma.",
+                    "status": "Agendado",
+                    "exames_laudos": [
+                        {
+                            "nome_arquivo": "ecg_carlos.txt",
+                            "tipo_arquivo": "text/plain",
+                            "arquivo": laudo_texto(
+                                "ELETROCARDIOGRAMA EM REPOUSO\n"
+                                "Ritmo sinusal, FC 72 bpm.\n"
+                                "Eixo elétrico normal. Sem alterações de repolarização.\n"
+                                "Conclusão: ECG dentro da normalidade.\n"
+                            ),
+                            "descricao": "Eletrocardiograma em repouso normal",
+                        }
+                    ],
                 },
                 {
                     "_id": consulta_carlos_2,
@@ -308,6 +366,8 @@ def montar_prontuarios(pacientes, medicos):
                     "sintomas": [],
                     "diagnosticos": ["Hipertensão arterial sistêmica (CID I10)"],
                     "observacoes": "ECG normal. PA controlada com a medicação.",
+                    "status": "Agendado",
+                    "exames_laudos": [],
                 },
             ],
             "prescricoes": [
@@ -316,20 +376,6 @@ def montar_prontuarios(pacientes, medicos):
                     "dosagem": "50 mg",
                     "frequencia": "1 vez ao dia, pela manhã",
                     "orientacoes": "Uso contínuo. Reduzir o consumo de sal.",
-                }
-            ],
-            "exames_laudos": [
-                {
-                    "nome_arquivo": "ecg_carlos.txt",
-                    "consulta_id": consulta_carlos_1,
-                    "tipo_arquivo": "text/plain",
-                    "arquivo": laudo_texto(
-                        "ELETROCARDIOGRAMA EM REPOUSO\n"
-                        "Ritmo sinusal, FC 72 bpm.\n"
-                        "Eixo elétrico normal. Sem alterações de repolarização.\n"
-                        "Conclusão: ECG dentro da normalidade.\n"
-                    ),
-                    "descricao": "Eletrocardiograma em repouso normal",
                 }
             ],
             "data_atualizacao": agora,
@@ -485,15 +531,16 @@ def ler_medicos(db):
                 "status": m["status"],
             },
         }
-        for m in db.profissionais.find(
-            {}, {"nome": 1, "crm": 1, "uf_crm": 1, "especialidades": 1, "status": 1}
+        for m in db.usuarios.find(
+            {"cargo": "Medico"},
+            {"nome": 1, "crm": 1, "uf_crm": 1, "especialidades": 1, "status": 1}
         )
     ]
 
 
 def ler_historico_clinico(db):
     atendimentos, diagnosticos, prescricoes = [], [], []
-    for prontuario in db.prontuarios.find({}, {"exames_laudos": 0}):
+    for prontuario in db.prontuarios.find({}):
         paciente_id = str(prontuario["paciente_id"])
 
         for consulta in prontuario.get("consultas", []):
@@ -622,10 +669,12 @@ def semear(db):
     }
     medicos = {
         chave: salvar(
-            db.profissionais, {"crm": doc["crm"], "uf_crm": doc["uf_crm"]}, doc
+            db.usuarios, {"crm": doc["crm"], "uf_crm": doc["uf_crm"]}, doc
         )
-        for chave, doc in PROFISSIONAIS.items()
+        for chave, doc in MEDICOS.items()
     }
+    for doc in RECEPCIONISTAS.values():
+        salvar(db.usuarios, {"cpf": doc["cpf"]}, doc)
     for prontuario in montar_prontuarios(pacientes, medicos):
         salvar(db.prontuarios, {"paciente_id": prontuario["paciente_id"]}, prontuario)
     for agendamento in montar_agendamentos(pacientes, medicos):

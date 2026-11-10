@@ -1,7 +1,7 @@
 import streamlit as st
 import redis
 from neo4j import GraphDatabase
-from pymongo import ASCENDING, DESCENDING, GEOSPHERE, MongoClient
+from pymongo import MongoClient
 
 @st.cache_resource
 def conectar_mongodb():
