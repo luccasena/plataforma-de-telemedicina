@@ -5,6 +5,34 @@ from services.prontuario_service import ProntuarioService
 
 prontuario_service = ProntuarioService(obter_banco_mongodb())
 
+def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
+    if arquivo is None:
+        st.error("Anexe o laudo médico para finalizar a consulta.")
+        return
+
+    limite_bytes = 16 * 1024 * 1024
+    if arquivo.size > limite_bytes:
+        st.error("O laudo não pode ultrapassar 16 MB.")
+        return
+
+    try:
+        finalizada = prontuario_service.finalizar_consulta(
+            paciente_id,
+            consulta_id,
+            arquivo,
+            receita.strip(),
+        )
+    except PyMongoError:
+        st.error("Não foi possível finalizar a consulta.")
+        return
+
+    if not finalizada:
+        st.error("A consulta não foi encontrada ou já foi finalizada.")
+        return
+
+    st.success("Consulta finalizada com status Concluído.")
+    st.rerun()
+
 def _exibir_consulta(consulta):
     titulo = (
         f"{consulta.get('paciente_nome', 'Paciente não encontrado')} - "
@@ -19,6 +47,29 @@ def _exibir_consulta(consulta):
             f"**Diagnósticos:** {', '.join(consulta.get('diagnosticos', [])) or '-'}"
         )
         st.write(f"**Observações:** {consulta.get('observacoes') or '-'}")
+
+        arquivo = st.file_uploader(
+            "Laudo médico (PDF)",
+            type=["pdf"],
+            key=f"laudo_{consulta['consulta_id']}",
+            help="Tamanho máximo: 16 MB, conforme o limite do MongoDB.",
+        )
+        receita = st.text_area(
+            "Receita / orientações",
+            key=f"receita_{consulta['consulta_id']}",
+            help="Opcional. Ex.: medicamento, dosagem, frequência e orientações.",
+        )
+        if st.button(
+            "Finalizar consulta",
+            type="primary",
+            key=f"finalizar_{consulta['consulta_id']}",
+        ):
+            _finalizar_consulta(
+                consulta["paciente_id"],
+                consulta["consulta_id"],
+                arquivo,
+                receita,
+            )
 
 def exibir_finalizacao():
     st.subheader("Finalização de Consultas")
