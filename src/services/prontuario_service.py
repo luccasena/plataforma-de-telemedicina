@@ -76,6 +76,46 @@ class ProntuarioService:
         )
         return resultado.acknowledged
 
+    def obter_consultas_em_andamento(self):
+        return list(
+            self.banco.get_collection("prontuarios").aggregate(
+                [
+                    {"$unwind": "$consultas"},
+                    {"$match": {"consultas.status": "Em andamento"}},
+                    {
+                        "$lookup": {
+                            "from": "pacientes",
+                            "localField": "paciente_id",
+                            "foreignField": "_id",
+                            "as": "paciente",
+                        }
+                    },
+                    {
+                        "$lookup": {
+                            "from": "usuarios",
+                            "localField": "consultas.medico_id",
+                            "foreignField": "_id",
+                            "as": "medico",
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "paciente_id": 1,
+                            "consulta_id": "$consultas._id",
+                            "queixa_principal": "$consultas.queixa_principal",
+                            "sintomas": "$consultas.sintomas",
+                            "diagnosticos": "$consultas.diagnosticos",
+                            "observacoes": "$consultas.observacoes",
+                            "paciente_nome": {"$first": "$paciente.nome"},
+                            "medico_nome": {"$first": "$medico.nome"},
+                        }
+                    },
+                    {"$sort": {"paciente_nome": 1}},
+                ]
+            )
+        )
+
     def obter_prontuario_por_paciente(self, paciente_id):
         prontuario = self.banco.get_collection("prontuarios").find_one(
             {"paciente_id": paciente_id}
