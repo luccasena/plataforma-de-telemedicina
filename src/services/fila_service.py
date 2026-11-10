@@ -36,10 +36,36 @@ class FilaService:
 
     def obter_fila(self):
         fila = []
-        for consulta_id in self.redis_client.zrange(CHAVE_FILA, 0, -1):
+        for posicao, consulta_id in enumerate(
+            self.redis_client.zrange(CHAVE_FILA, 0, -1)
+        ):
             dados = self.redis_client.hgetall(f"{PREFIXO_CONSULTA}{consulta_id}")
-            fila.append({"consulta_id": consulta_id, **dados})
+            fila.append(
+                {"consulta_id": consulta_id, "posicao": posicao + 1, **dados}
+            )
         return fila
+
+    def chamar_proximo(self):
+        proximos = self.redis_client.zpopmin(CHAVE_FILA, 1)
+        if not proximos:
+            return None
+
+        consulta_id = proximos[0][0]
+        chave_consulta = f"{PREFIXO_CONSULTA}{consulta_id}"
+        self.redis_client.hset(chave_consulta, "status", "Em atendimento")
+        return {"consulta_id": consulta_id, **self.redis_client.hgetall(chave_consulta)}
+
+    def obter_consultas_ativas(self):
+        consultas = []
+        for chave in self.redis_client.scan_iter(
+            match=f"{PREFIXO_CONSULTA}*"
+        ):
+            dados = self.redis_client.hgetall(chave)
+            if dados.get("status") == "Em atendimento":
+                consultas.append(
+                    {"consulta_id": chave[len(PREFIXO_CONSULTA) :], **dados}
+                )
+        return consultas
 
     def remover_da_fila(self, consulta_id):
         chave_consulta = f"{PREFIXO_CONSULTA}{consulta_id}"

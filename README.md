@@ -11,12 +11,47 @@ docker compose up -d
 ## Gerar dados iniciais
 
 Com os containers em execução, gere as coleções, os validadores e os dados de
-exemplo no MongoDB e no Neo4j:
+exemplo no MongoDB e no Neo4j. Depois, aqueça o cache das agendas futuras no
+Redis:
 
 ```bash
 python src/config/seed.py
+python src/config/seed_agendas.py
 ```
 
+## Executar localmente (Windows PowerShell)
+
+Na raiz do projeto, crie o ambiente Python, instale as dependências e prepare
+os arquivos locais de configuração:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+if (-not (Test-Path .env)) { Copy-Item .env-example .env }
+if (-not (Test-Path .streamlit\secrets.toml)) {
+    Copy-Item .streamlit\secrets-example.toml .streamlit\secrets.toml
+}
+```
+
+Confirme que as credenciais de `.env` correspondem às URLs e credenciais em
+`.streamlit\secrets.toml`. Suba os bancos, gere os dados e inicie o Streamlit:
+
+```powershell
+docker compose up -d
+python src/config/seed.py
+python src/config/seed_agendas.py
+$env:PYTHONPATH = "src"
+streamlit run src/app.py
+```
+
+Para executar os testes do cache de agendas, em outro terminal com o mesmo
+ambiente virtual ativado:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m unittest discover -s src/tests -v
+```
 
 Serviços disponíveis:
 
@@ -25,8 +60,25 @@ Serviços disponíveis:
 - Neo4j Browser: `http://localhost:7474`
 - Neo4j Bolt: `bolt://localhost:7687`
 
-As credenciais podem ser sobrescritas com as variáveis `MONGO_ROOT_USERNAME`,
+As credenciais podem ser sobrescritas com as variáveis `MONGO_ROOT_USER`,
 `MONGO_ROOT_PASSWORD`, `REDIS_PASSWORD` e `NEO4J_AUTH`.
+
+## Recepção Virtual: fila e agenda
+
+A tela **Recepção Virtual** apresenta a fila ordenada por chegada, posição e
+tempo de espera. A recepção pode selecionar um paciente ativo e adicioná-lo à
+fila; **Chamar próximo paciente** retira o primeiro da fila e o exibe em
+**Consultas em atendimento**. A tela lista também as sessões Redis ainda
+válidas e atualiza os dados automaticamente a cada 15 segundos (ou pelo botão
+**Atualizar agora**).
+
+A agenda do médico e do dia selecionados usa cache-aside: consulta primeiro
+`agenda:medico:<medico_id>:<AAAA-MM-DD>` no Redis e, em caso de ausência,
+consulta os agendamentos confirmados/em atendimento no MongoDB e guarda o
+resultado por 12 horas. `AgendaCacheService.invalidar_agenda_dia(medico_id, data)`
+remove o cache daquele médico e dia; qualquer fluxo que altere um agendamento
+deve chamar esse método após persistir a alteração no MongoDB.
+`seed_agendas.py` preaquece as agendas futuras já existentes no MongoDB.
 
 ## Finalização de Consultas
 
