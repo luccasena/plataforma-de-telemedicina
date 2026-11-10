@@ -1,4 +1,4 @@
-# plataforma-de-telemedicina
+# Plataforma de Telemedicina
 
 ## Infraestrutura local
 
@@ -7,6 +7,16 @@ Para iniciar MongoDB, Redis e Neo4j:
 ```bash
 docker compose up -d
 ```
+
+## Gerar dados iniciais
+
+Com os containers em execução, gere as coleções, os validadores e os dados de
+exemplo no MongoDB e no Neo4j:
+
+```bash
+python src/config/seed.py
+```
+
 
 Serviços disponíveis:
 
