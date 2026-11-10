@@ -1,9 +1,12 @@
 import streamlit as st
 from pymongo.errors import PyMongoError
-from config.database import obter_banco_mongodb
+from redis.exceptions import RedisError
+from config.database import conectar_redis, obter_banco_mongodb
+from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
 
 prontuario_service = ProntuarioService(obter_banco_mongodb())
+fila_service = FilaService(conectar_redis())
 
 def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
     if arquivo is None:
@@ -30,7 +33,13 @@ def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
         st.error("A consulta não foi encontrada ou já foi finalizada.")
         return
 
-    st.success("Consulta finalizada com status Concluído.")
+    try:
+        fila_service.remover_da_fila(consulta_id)
+    except RedisError:
+        st.toast("Consulta finalizada, mas não foi possível atualizar a fila.")
+    else:
+        st.toast("Consulta finalizada com status Concluído.")
+
     st.rerun()
 
 def _exibir_consulta(consulta):
