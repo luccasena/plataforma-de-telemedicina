@@ -116,7 +116,7 @@ class ProntuarioService:
             )
         )
 
-    def finalizar_consulta(self, paciente_id, consulta_id, arquivo):
+    def finalizar_consulta(self, paciente_id, consulta_id, arquivo, receita):
         laudo = {
             "nome_arquivo": arquivo.name,
             "tipo_arquivo": arquivo.type,
@@ -135,6 +135,7 @@ class ProntuarioService:
             {
                 "$set": {
                     "consultas.$[consulta].status": "Concluído",
+                    "consultas.$[consulta].receita": receita,
                     "consultas.$[consulta].data_finalizacao": datetime.now(timezone.utc),
                     "data_atualizacao": datetime.now(timezone.utc),
                 },

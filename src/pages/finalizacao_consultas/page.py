@@ -5,7 +5,7 @@ from services.prontuario_service import ProntuarioService
 
 prontuario_service = ProntuarioService(obter_banco_mongodb())
 
-def _finalizar_consulta(paciente_id, consulta_id, arquivo):
+def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
     if arquivo is None:
         st.error("Anexe o laudo médico para finalizar a consulta.")
         return
@@ -20,6 +20,7 @@ def _finalizar_consulta(paciente_id, consulta_id, arquivo):
             paciente_id,
             consulta_id,
             arquivo,
+            receita.strip(),
         )
     except PyMongoError:
         st.error("Não foi possível finalizar a consulta.")
@@ -53,12 +54,22 @@ def _exibir_consulta(consulta):
             key=f"laudo_{consulta['consulta_id']}",
             help="Tamanho máximo: 16 MB, conforme o limite do MongoDB.",
         )
+        receita = st.text_area(
+            "Receita / orientações",
+            key=f"receita_{consulta['consulta_id']}",
+            help="Opcional. Ex.: medicamento, dosagem, frequência e orientações.",
+        )
         if st.button(
             "Finalizar consulta",
             type="primary",
             key=f"finalizar_{consulta['consulta_id']}",
         ):
-            _finalizar_consulta(consulta["paciente_id"], consulta["consulta_id"], arquivo)
+            _finalizar_consulta(
+                consulta["paciente_id"],
+                consulta["consulta_id"],
+                arquivo,
+                receita,
+            )
 
 def exibir_finalizacao():
     st.subheader("Finalização de Consultas")
