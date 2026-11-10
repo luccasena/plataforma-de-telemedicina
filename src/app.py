@@ -1,9 +1,11 @@
 import streamlit as st
 from pymongo.errors import PyMongoError
 from services.usuario_service import UsuarioService
-from config.database import obter_banco_mongodb
+from config.database import conectar_redis, obter_banco_mongodb
+from services.sessao_service import SessaoService
 
 usuario_service = UsuarioService(obter_banco_mongodb())
+sessao_service = SessaoService(conectar_redis())
 
 def exibir_login():
     st.title("Login")
@@ -31,10 +33,17 @@ def exibir_login():
         st.error("E-mail ou senha inválidos.")
         return
 
+    token = sessao_service.criar_sessao(usuario)
+    st.session_state["token_sessao"] = token
     st.session_state["usuario"] = usuario
     st.rerun()
 
 def exibir_aplicacao():
+    if st.sidebar.button("Sair"):
+        sessao_service.revogar_sessao(st.session_state.get("token_sessao"))
+        st.session_state.clear()
+        st.rerun()
+
     home_page = st.Page(
         "pages/home/page.py",
         title="Página Inicial",
@@ -68,7 +77,12 @@ def exibir_aplicacao():
     )
     pagina.run()
 
-if "usuario" not in st.session_state:
+token_sessao = st.session_state.get("token_sessao")
+usuario_sessao = sessao_service.obter_usuario(token_sessao)
+
+if usuario_sessao is None:
+    st.session_state.clear()
     exibir_login()
 else:
+    st.session_state["usuario"] = usuario_sessao
     exibir_aplicacao()

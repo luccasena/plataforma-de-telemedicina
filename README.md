@@ -71,3 +71,15 @@ Métodos:
 - `obter_fila()`: retorna a fila em ordem de chegada.
 - `remover_da_fila(consulta_id)`: tira a consulta da fila e marca como
   `Concluído`.
+
+## Sessões de usuários no Redis
+
+Após o login validado no MongoDB, o sistema cria um token aleatório e armazena
+no Redis somente o hash desse token. A sessão usa a chave
+`sessao:<hash_do_token>`, contém os dados mínimos do usuário e expira após 8
+horas. Cada validação renova o TTL; o botão `Sair` revoga a sessão removendo a
+chave do Redis.
+
+Essa implementação está no `SessaoService`
+(`src/services/sessao_service.py`), enquanto o token permanece apenas no
+`st.session_state` da sessão ativa do Streamlit.
