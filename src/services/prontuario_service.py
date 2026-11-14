@@ -76,12 +76,37 @@ class ProntuarioService:
         )
         return resultado.acknowledged
 
+    def obter_consultas_agendadas(self):
+        return self._obter_consultas_por_status("Agendado")
+
     def obter_consultas_em_andamento(self):
+        return self._obter_consultas_por_status("Em andamento")
+
+    def iniciar_consulta(self, paciente_id, consulta_id):
+        agora = datetime.now(timezone.utc)
+        resultado = self.banco.get_collection("prontuarios").update_one(
+            {
+                "paciente_id": paciente_id,
+                "consultas": {
+                    "$elemMatch": {"_id": consulta_id, "status": "Agendado"}
+                },
+            },
+            {
+                "$set": {
+                    "consultas.$[consulta].status": "Em andamento",
+                    "data_atualizacao": agora,
+                }
+            },
+            array_filters=[{"consulta._id": consulta_id}],
+        )
+        return resultado.matched_count > 0
+
+    def _obter_consultas_por_status(self, status):
         return list(
             self.banco.get_collection("prontuarios").aggregate(
                 [
                     {"$unwind": "$consultas"},
-                    {"$match": {"consultas.status": "Em andamento"}},
+                    {"$match": {"consultas.status": status}},
                     {
                         "$lookup": {
                             "from": "pacientes",
@@ -108,6 +133,7 @@ class ProntuarioService:
                             "diagnosticos": "$consultas.diagnosticos",
                             "observacoes": "$consultas.observacoes",
                             "paciente_nome": {"$first": "$paciente.nome"},
+                            "paciente_cpf": {"$first": "$paciente.cpf"},
                             "medico_nome": {"$first": "$medico.nome"},
                         }
                     },

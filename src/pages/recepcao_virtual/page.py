@@ -1,13 +1,15 @@
 from datetime import date, datetime, timedelta, timezone
-from uuid import uuid4
 
 import streamlit as st
+from bson import ObjectId
+from bson.errors import InvalidId
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
 
 from config.database import conectar_redis, obter_banco_mongodb
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
+from services.prontuario_service import ProntuarioService
 
 
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
@@ -15,14 +17,7 @@ banco = obter_banco_mongodb()
 redis_client = conectar_redis()
 fila_service = FilaService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, banco)
-
-
-def _carregar_pacientes():
-    return list(
-        banco.get_collection("pacientes")
-        .find({"status": "Ativo"}, {"nome": 1, "cpf": 1})
-        .sort("nome", 1)
-    )
+prontuario_service = ProntuarioService(banco)
 
 
 def _carregar_medicos():
@@ -43,14 +38,82 @@ def _formatar_horario(valor):
     return horario.astimezone(FUSO_BRASILIA).strftime("%H:%M")
 
 
-def _adicionar_paciente(paciente):
-    consulta_id = uuid4().hex
-    fila_service.adicionar_na_fila(
-        consulta_id,
-        paciente["_id"],
-        paciente["nome"],
+def _rotular_consulta(consulta):
+    return (
+        f"{consulta.get('paciente_nome') or 'Paciente não encontrado'}"
+        f" - Queixa: {consulta.get('queixa_principal') or 'não informada'}"
+        f" - Médico: {consulta.get('medico_nome') or 'não encontrado'}"
     )
-    st.success(f"{paciente['nome']} foi adicionado(a) à fila.")
+
+
+def _exibir_adicionar_fila():
+    ids_na_fila = fila_service.obter_ids_na_fila()
+    consultas = {
+        str(consulta["consulta_id"]): consulta
+        for consulta in prontuario_service.obter_consultas_agendadas()
+        if str(consulta["consulta_id"]) not in ids_na_fila
+    }
+    if not consultas:
+        st.info("Não há consultas agendadas aguardando entrada na fila.")
+        return
+
+    with st.form("adicionar_fila"):
+        consulta_id = st.selectbox(
+            "Consulta agendada",
+            list(consultas),
+            format_func=lambda opcao: _rotular_consulta(consultas[opcao]),
+        )
+        adicionar = st.form_submit_button("Adicionar à fila")
+
+    if adicionar:
+        consulta = consultas[consulta_id]
+        paciente_nome = consulta.get("paciente_nome") or "Paciente"
+        fila_service.adicionar_na_fila(
+            consulta_id,
+            consulta["paciente_id"],
+            paciente_nome,
+        )
+        st.toast(f"{paciente_nome} foi adicionado(a) à fila.")
+        st.rerun()
+
+
+def _chamar_proximo():
+    proximo = fila_service.chamar_proximo()
+    if proximo is None:
+        st.info("Não há pacientes aguardando.")
+        return
+
+    paciente_nome = proximo.get("paciente_nome", "Paciente")
+    try:
+        paciente_id = ObjectId(proximo["paciente_id"])
+        consulta_id = ObjectId(proximo["consulta_id"])
+    except (KeyError, InvalidId):
+        fila_service.descartar(proximo["consulta_id"])
+        st.warning(
+            f"A entrada de {paciente_nome} não corresponde a uma consulta "
+            "agendada e foi removida da fila."
+        )
+        return
+
+    try:
+        iniciada = prontuario_service.iniciar_consulta(paciente_id, consulta_id)
+    except PyMongoError:
+        fila_service.devolver_a_fila(proximo["consulta_id"])
+        st.error(
+            "Não foi possível iniciar a consulta. O paciente voltou para a fila."
+        )
+        return
+
+    if not iniciada:
+        fila_service.descartar(proximo["consulta_id"])
+        st.warning(
+            f"A consulta de {paciente_nome} não está mais com status Agendado "
+            "e foi removida da fila."
+        )
+        return
+
+    st.toast(f"Paciente chamado: {paciente_nome}. Consulta em andamento.")
+    st.rerun()
 
 
 def _exibir_fila():
@@ -69,14 +132,7 @@ def _exibir_fila():
             )
 
     if st.button("Chamar próximo paciente", type="primary"):
-        proximo = fila_service.chamar_proximo()
-        if proximo is None:
-            st.info("Não há pacientes aguardando.")
-        else:
-            st.success(
-                f"Paciente chamado: {proximo.get('paciente_nome', 'Paciente')}."
-            )
-            st.rerun()
+        _chamar_proximo()
 
 
 def _exibir_agenda(medicos):
@@ -162,21 +218,8 @@ def _exibir_sessoes_ativas():
 
 def _exibir_painel():
     try:
-        pacientes = _carregar_pacientes()
         medicos = _carregar_medicos()
-        if pacientes:
-            opcoes = {
-                f"{paciente['nome']} - CPF: {paciente.get('cpf', 'não informado')}": paciente
-                for paciente in pacientes
-            }
-            with st.form("adicionar_fila"):
-                paciente = opcoes[st.selectbox("Paciente", list(opcoes))]
-                adicionar = st.form_submit_button("Adicionar à fila")
-            if adicionar:
-                _adicionar_paciente(paciente)
-        else:
-            st.info("Nenhum paciente ativo cadastrado.")
-
+        _exibir_adicionar_fila()
         _exibir_fila()
         _exibir_agenda(medicos)
         _exibir_consultas_ativas()

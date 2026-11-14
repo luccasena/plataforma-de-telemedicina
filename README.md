@@ -66,9 +66,9 @@ As credenciais podem ser sobrescritas com as variáveis `MONGO_ROOT_USER`,
 ## Recepção Virtual: fila e agenda
 
 A tela **Recepção Virtual** apresenta a fila ordenada por chegada, posição e
-tempo de espera. A recepção pode selecionar um paciente ativo e adicioná-lo à
-fila; **Chamar próximo paciente** retira o primeiro da fila e o exibe em
-**Consultas em atendimento**. A tela lista também as sessões Redis ainda
+tempo de espera. A recepção só pode adicionar à fila consultas com status
+`Agendado` no prontuário; **Chamar próximo paciente** retira o primeiro da fila,
+muda a consulta para `Em andamento` e a exibe em **Consultas em atendimento**. A tela lista também as sessões Redis ainda
 válidas e atualiza os dados automaticamente a cada 15 segundos (ou pelo botão
 **Atualizar agora**).
 
@@ -113,7 +113,7 @@ e Finalização de Consultas através do `FilaService`
 | `fila:espera` | Sorted Set | membro = id da consulta, score = horário de chegada (timestamp) |
 | `fila:consulta:<id>` | Hash | `paciente_id`, `paciente_nome`, `status`, `chegada` |
 
-Status na fila: `Aguardando` → `Concluído`. Ao ser concluída, a consulta sai
+Status na fila: `Aguardando` → `Em andamento` → `Concluído`. Ao ser concluída, a consulta sai
 do Sorted Set e o hash expira em 24 horas.
 
 Métodos:
