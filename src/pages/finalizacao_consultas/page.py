@@ -1,12 +1,16 @@
 import streamlit as st
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
-from config.database import conectar_redis, obter_banco_mongodb
+from config.database import conectar_redis, obter_mongo_repository
+from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
 
-prontuario_service = ProntuarioService(obter_banco_mongodb())
-fila_service = FilaService(conectar_redis())
+mongo_repository = obter_mongo_repository()
+redis_client = conectar_redis()
+prontuario_service = ProntuarioService(mongo_repository)
+fila_service = FilaService(redis_client)
+agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
 
 def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
     if arquivo is None:
@@ -35,8 +39,11 @@ def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
 
     try:
         fila_service.remover_da_fila(consulta_id)
-    except RedisError:
-        st.toast("Consulta finalizada, mas não foi possível atualizar a fila.")
+        agenda_cache_service.invalidar_agendas_da_consulta(consulta_id)
+    except (RedisError, PyMongoError):
+        st.toast(
+            "Consulta finalizada, mas não foi possível atualizar a fila e a agenda."
+        )
     else:
         st.toast("Consulta finalizada com status Concluído.")
 

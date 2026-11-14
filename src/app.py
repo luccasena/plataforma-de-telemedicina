@@ -1,10 +1,10 @@
 import streamlit as st
 from pymongo.errors import PyMongoError
 from services.usuario_service import UsuarioService
-from config.database import conectar_redis, obter_banco_mongodb
+from config.database import conectar_redis, obter_mongo_repository
 from services.sessao_service import SessaoService
 
-usuario_service = UsuarioService(obter_banco_mongodb())
+usuario_service = UsuarioService(obter_mongo_repository())
 sessao_service = SessaoService(conectar_redis())
 
 def exibir_login():
@@ -81,7 +81,8 @@ token_sessao = st.session_state.get("token_sessao")
 usuario_sessao = sessao_service.obter_usuario(token_sessao)
 
 if usuario_sessao is None:
-    st.session_state.clear()
+    if token_sessao:
+        st.session_state.clear()
     exibir_login()
 else:
     st.session_state["usuario"] = usuario_sessao

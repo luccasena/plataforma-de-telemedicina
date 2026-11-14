@@ -11,12 +11,45 @@ docker compose up -d
 ## Gerar dados iniciais
 
 Com os containers em execução, gere as coleções, os validadores e os dados de
-exemplo no MongoDB e no Neo4j:
+exemplo no MongoDB e no Neo4j. O mesmo script também recarrega no Redis o cache
+das agendas futuras:
 
 ```bash
 python src/config/seed.py
 ```
 
+## Executar localmente (Windows PowerShell)
+
+Na raiz do projeto, crie o ambiente Python, instale as dependências e prepare
+os arquivos locais de configuração:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+if (-not (Test-Path .env)) { Copy-Item .env-example .env }
+if (-not (Test-Path .streamlit\secrets.toml)) {
+    Copy-Item .streamlit\secrets-example.toml .streamlit\secrets.toml
+}
+```
+
+Confirme que as credenciais de `.env` correspondem às URLs e credenciais em
+`.streamlit\secrets.toml`. Suba os bancos, gere os dados e inicie o Streamlit:
+
+```powershell
+docker compose up -d
+python src/config/seed.py
+$env:PYTHONPATH = "src"
+streamlit run src/app.py
+```
+
+Para executar os testes, em outro terminal com o mesmo
+ambiente virtual ativado:
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m unittest discover -s src/tests -v
+```
 
 Serviços disponíveis:
 
@@ -25,8 +58,38 @@ Serviços disponíveis:
 - Neo4j Browser: `http://localhost:7474`
 - Neo4j Bolt: `bolt://localhost:7687`
 
-As credenciais podem ser sobrescritas com as variáveis `MONGO_ROOT_USERNAME`,
+As credenciais podem ser sobrescritas com as variáveis `MONGO_ROOT_USER`,
 `MONGO_ROOT_PASSWORD`, `REDIS_PASSWORD` e `NEO4J_AUTH`.
+
+## Recepção Virtual: fila e agenda
+
+A tela **Recepção Virtual** apresenta a fila ordenada por chegada, posição e
+tempo de espera. A recepção só pode adicionar à fila consultas com status
+`Agendado` no prontuário; **Chamar próximo paciente** retira o primeiro da fila,
+muda a consulta para `Em andamento` e a exibe em **Consultas em atendimento**. A tela lista também as sessões Redis ainda
+válidas e atualiza os dados automaticamente a cada 15 segundos (ou pelo botão
+**Atualizar agora**).
+
+Cada documento de `agendamentos` aponta para a consulta do prontuário pelo
+campo `consulta_id` (obrigatório nos agendamentos `confirmado` e
+`em_atendimento`). A **Agenda do dia** lista, para o médico e a data
+selecionados, as consultas referenciadas pelos agendamentos confirmados/em
+atendimento, com o intervalo `horario_inicio` - `horario_fim`, o paciente, a
+queixa principal e o status atual da consulta.
+
+A agenda usa cache-aside: consulta primeiro
+`agenda:medico:<medico_id>:<AAAA-MM-DD>` no Redis e, em caso de ausência,
+monta a agenda no MongoDB e guarda o resultado por 12 horas. Como o cache
+guarda o status da consulta, ele precisa ser descartado sempre que um
+agendamento ou o status de uma consulta mudar:
+
+- `AgendaCacheService.invalidar_agenda_dia(medico_id, data)`: remove o cache
+  daquele médico e dia.
+- `AgendaCacheService.invalidar_agendas_da_consulta(consulta_id)`: remove o
+  cache de todos os dias em que a consulta está agendada. É chamado ao chamar o
+  próximo paciente e ao finalizar a consulta.
+
+O `seed.py` descarta e recarrega o cache das agendas futuras.
 
 ## Finalização de Consultas
 
@@ -61,7 +124,7 @@ e Finalização de Consultas através do `FilaService`
 | `fila:espera` | Sorted Set | membro = id da consulta, score = horário de chegada (timestamp) |
 | `fila:consulta:<id>` | Hash | `paciente_id`, `paciente_nome`, `status`, `chegada` |
 
-Status na fila: `Aguardando` → `Concluído`. Ao ser concluída, a consulta sai
+Status na fila: `Aguardando` → `Em andamento` → `Concluído`. Ao ser concluída, a consulta sai
 do Sorted Set e o hash expira em 24 horas.
 
 Métodos:

@@ -2,10 +2,21 @@ from datetime import datetime, timezone
 
 from bson import ObjectId
 
+from repositories.mongo_repository import MongoRepository
+
+COLECAO_PRONTUARIOS = "prontuarios"
+STATUS_AGENDADO = "Agendado"
+STATUS_EM_ANDAMENTO = "Em andamento"
+STATUS_CONCLUIDO = "Concluído"
+
+
+def _filtro_da_consulta(consulta_id):
+    return [{"consulta._id": consulta_id}]
+
 
 class ProntuarioService:
-    def __init__(self, banco):
-        self.banco = banco
+    def __init__(self, mongo_repository: MongoRepository):
+        self.mongo_repository = mongo_repository
 
     def atualizar_anexo(self, paciente_id, consulta_id, arquivo):
         anexo = {
@@ -15,8 +26,8 @@ class ProntuarioService:
             "tamanho_bytes": arquivo.size,
             "data_upload": datetime.now(timezone.utc),
         }
-        colecao = self.banco.get_collection("prontuarios")
-        resultado = colecao.update_one(
+        resultado = self.mongo_repository.update_document(
+            COLECAO_PRONTUARIOS,
             {"paciente_id": paciente_id, "consultas._id": consulta_id},
             {
                 "$set": {
@@ -24,24 +35,17 @@ class ProntuarioService:
                     "data_atualizacao": datetime.now(timezone.utc),
                 }
             },
-            array_filters=[{"consulta._id": consulta_id}],
+            array_filters=_filtro_da_consulta(consulta_id),
         )
         return resultado.matched_count > 0
 
     def atualizar_diagnosticos(self, paciente_id, consulta_id, diagnosticos):
-        resultado = self.banco.get_collection("prontuarios").update_one(
+        resultado = self.mongo_repository.update_document(
+            COLECAO_PRONTUARIOS,
             {"paciente_id": paciente_id, "consultas._id": consulta_id},
             {"$set": {"consultas.$.diagnosticos": diagnosticos}},
         )
         return resultado.matched_count > 0
-
-    def obter_medicos(self):
-        return list(
-            self.banco.get_collection("usuarios").find(
-                {"cargo": "Medico", "status": "Ativo"},
-                {"nome": 1, "crm": 1},
-            ).sort("nome", 1)
-        )
 
     def criar_consulta(
         self,
@@ -59,10 +63,11 @@ class ProntuarioService:
             "sintomas": sintomas,
             "diagnosticos": diagnosticos,
             "observacoes": observacoes,
-            "status": "Agendado",
+            "status": STATUS_AGENDADO,
             "exames_laudos": [],
         }
-        resultado = self.banco.get_collection("prontuarios").update_one(
+        resultado = self.mongo_repository.update_document(
+            COLECAO_PRONTUARIOS,
             {"paciente_id": paciente_id},
             {
                 "$setOnInsert": {
@@ -76,44 +81,70 @@ class ProntuarioService:
         )
         return resultado.acknowledged
 
+    def obter_consultas_agendadas(self):
+        return self._obter_consultas_por_status(STATUS_AGENDADO)
+
     def obter_consultas_em_andamento(self):
-        return list(
-            self.banco.get_collection("prontuarios").aggregate(
-                [
-                    {"$unwind": "$consultas"},
-                    {"$match": {"consultas.status": "Em andamento"}},
-                    {
-                        "$lookup": {
-                            "from": "pacientes",
-                            "localField": "paciente_id",
-                            "foreignField": "_id",
-                            "as": "paciente",
-                        }
-                    },
-                    {
-                        "$lookup": {
-                            "from": "usuarios",
-                            "localField": "consultas.medico_id",
-                            "foreignField": "_id",
-                            "as": "medico",
-                        }
-                    },
-                    {
-                        "$project": {
-                            "_id": 0,
-                            "paciente_id": 1,
-                            "consulta_id": "$consultas._id",
-                            "queixa_principal": "$consultas.queixa_principal",
-                            "sintomas": "$consultas.sintomas",
-                            "diagnosticos": "$consultas.diagnosticos",
-                            "observacoes": "$consultas.observacoes",
-                            "paciente_nome": {"$first": "$paciente.nome"},
-                            "medico_nome": {"$first": "$medico.nome"},
-                        }
-                    },
-                    {"$sort": {"paciente_nome": 1}},
-                ]
-            )
+        return self._obter_consultas_por_status(STATUS_EM_ANDAMENTO)
+
+    def iniciar_consulta(self, paciente_id, consulta_id):
+        agora = datetime.now(timezone.utc)
+        resultado = self.mongo_repository.update_document(
+            COLECAO_PRONTUARIOS,
+            {
+                "paciente_id": paciente_id,
+                "consultas": {
+                    "$elemMatch": {"_id": consulta_id, "status": STATUS_AGENDADO}
+                },
+            },
+            {
+                "$set": {
+                    "consultas.$[consulta].status": STATUS_EM_ANDAMENTO,
+                    "data_atualizacao": agora,
+                }
+            },
+            array_filters=_filtro_da_consulta(consulta_id),
+        )
+        return resultado.matched_count > 0
+
+    def _obter_consultas_por_status(self, status):
+        return self.mongo_repository.aggregate(
+            COLECAO_PRONTUARIOS,
+            [
+                {"$unwind": "$consultas"},
+                {"$match": {"consultas.status": status}},
+                {
+                    "$lookup": {
+                        "from": "pacientes",
+                        "localField": "paciente_id",
+                        "foreignField": "_id",
+                        "as": "paciente",
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": "usuarios",
+                        "localField": "consultas.medico_id",
+                        "foreignField": "_id",
+                        "as": "medico",
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "paciente_id": 1,
+                        "consulta_id": "$consultas._id",
+                        "queixa_principal": "$consultas.queixa_principal",
+                        "sintomas": "$consultas.sintomas",
+                        "diagnosticos": "$consultas.diagnosticos",
+                        "observacoes": "$consultas.observacoes",
+                        "paciente_nome": {"$first": "$paciente.nome"},
+                        "paciente_cpf": {"$first": "$paciente.cpf"},
+                        "medico_nome": {"$first": "$medico.nome"},
+                    }
+                },
+                {"$sort": {"paciente_nome": 1}},
+            ],
         )
 
     def finalizar_consulta(self, paciente_id, consulta_id, arquivo, receita):
@@ -125,29 +156,30 @@ class ProntuarioService:
             "data_upload": datetime.now(timezone.utc),
             "descricao": "Laudo de finalização da consulta",
         }
-        resultado = self.banco.get_collection("prontuarios").update_one(
+        resultado = self.mongo_repository.update_document(
+            COLECAO_PRONTUARIOS,
             {
                 "paciente_id": paciente_id,
                 "consultas": {
-                    "$elemMatch": {"_id": consulta_id, "status": "Em andamento"}
+                    "$elemMatch": {"_id": consulta_id, "status": STATUS_EM_ANDAMENTO}
                 },
             },
             {
                 "$set": {
-                    "consultas.$[consulta].status": "Concluído",
+                    "consultas.$[consulta].status": STATUS_CONCLUIDO,
                     "consultas.$[consulta].receita": receita,
                     "consultas.$[consulta].data_finalizacao": datetime.now(timezone.utc),
                     "data_atualizacao": datetime.now(timezone.utc),
                 },
                 "$push": {"consultas.$[consulta].exames_laudos": laudo},
             },
-            array_filters=[{"consulta._id": consulta_id}],
+            array_filters=_filtro_da_consulta(consulta_id),
         )
         return resultado.matched_count > 0
 
     def obter_prontuario_por_paciente(self, paciente_id):
-        prontuario = self.banco.get_collection("prontuarios").find_one(
-            {"paciente_id": paciente_id}
+        prontuario = self.mongo_repository.find_document(
+            COLECAO_PRONTUARIOS, {"paciente_id": paciente_id}
         )
         if not prontuario:
             return None
