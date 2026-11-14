@@ -1,19 +1,20 @@
 import streamlit as st
 from pymongo.errors import PyMongoError
 from services.paciente_service import PacienteService
-from config.database import obter_banco_mongodb
+from config.database import obter_mongo_repository
 from services.prontuario_service import ProntuarioService
 from services.usuario_service import UsuarioService
 
-paciente_service = PacienteService(obter_banco_mongodb())
-prontuario_service = ProntuarioService(obter_banco_mongodb())
-usuario_service = UsuarioService(obter_banco_mongodb())
+mongo_repository = obter_mongo_repository()
+paciente_service = PacienteService(mongo_repository)
+prontuario_service = ProntuarioService(mongo_repository)
+usuario_service = UsuarioService(mongo_repository)
 
 @st.dialog("Criar consulta")
 def _criar_consulta_modal():
     try:
         medicos = usuario_service.obter_medicos()
-        pacientes = paciente_service.obter_pacientes() or []
+        pacientes = paciente_service.obter_pacientes()
     except PyMongoError:
         st.error("Não foi possível carregar os usuários.")
         return
@@ -197,7 +198,11 @@ def exibir_historico():
         if st.button("Criar consulta"):
              _criar_consulta_modal()
 
-    pacientes = paciente_service.obter_pacientes()
+    try:
+        pacientes = paciente_service.obter_pacientes()
+    except PyMongoError:
+        st.error("Não foi possível carregar os pacientes.")
+        return
 
     if not pacientes:
         st.info("Nenhum paciente cadastrado.")
