@@ -39,6 +39,7 @@ from pymongo.errors import ServerSelectionTimeoutError
 from redis.exceptions import RedisError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from repositories.mongo_repository import MongoRepository  # noqa: E402
 from services.agenda_cache_service import (  # noqa: E402
     PREFIXO_AGENDA,
     STATUS_AGENDA_CACHE,
@@ -749,7 +750,7 @@ def recarregar_cache_agendas(db, redis_client):
     for chave in redis_client.scan_iter(match=f"{PREFIXO_AGENDA}*"):
         redis_client.delete(chave)
 
-    cache = AgendaCacheService(redis_client, db)
+    cache = AgendaCacheService(redis_client, MongoRepository(db))
     agendamentos = db.agendamentos.find(
         {
             "status": {"$in": STATUS_AGENDA_CACHE},

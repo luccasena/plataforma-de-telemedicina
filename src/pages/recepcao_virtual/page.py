@@ -6,29 +6,20 @@ from bson.errors import InvalidId
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
 
-from config.database import conectar_redis, obter_banco_mongodb
+from config.database import conectar_redis, obter_mongo_repository
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
+from services.usuario_service import UsuarioService
 
 
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
-banco = obter_banco_mongodb()
+mongo_repository = obter_mongo_repository()
 redis_client = conectar_redis()
 fila_service = FilaService(redis_client)
-agenda_cache_service = AgendaCacheService(redis_client, banco)
-prontuario_service = ProntuarioService(banco)
-
-
-def _carregar_medicos():
-    return list(
-        banco.get_collection("usuarios")
-        .find(
-            {"cargo": "Medico", "status": "Ativo"},
-            {"nome": 1, "crm": 1},
-        )
-        .sort("nome", 1)
-    )
+agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
+prontuario_service = ProntuarioService(mongo_repository)
+usuario_service = UsuarioService(mongo_repository)
 
 
 def _formatar_horario(valor):
@@ -227,7 +218,7 @@ def _exibir_sessoes_ativas():
 
 def _exibir_painel():
     try:
-        medicos = _carregar_medicos()
+        medicos = usuario_service.obter_medicos()
         _exibir_adicionar_fila()
         _exibir_fila()
         _exibir_agenda(medicos)

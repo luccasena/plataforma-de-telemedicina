@@ -27,38 +27,32 @@ class RedisFake:
         return int(existed)
 
 
-class CollectionFake:
+class MongoRepositoryFake:
     def __init__(self, documents, agendamentos=()):
         self.documents = documents
         self.agendamentos = list(agendamentos)
         self.aggregate_calls = 0
 
-    def aggregate(self, pipeline):
+    def aggregate(self, collection_name, pipeline):
+        if collection_name != "agendamentos":
+            raise AssertionError(f"Unexpected collection: {collection_name}")
         self.aggregate_calls += 1
         return self.documents
 
-    def find(self, filtro, projecao=None):
+    def find_documents(self, collection_name, query, projection=None, sort=None):
+        if collection_name != "agendamentos":
+            raise AssertionError(f"Unexpected collection: {collection_name}")
         return [
             agendamento
             for agendamento in self.agendamentos
-            if agendamento["consulta_id"] == filtro["consulta_id"]
+            if agendamento["consulta_id"] == query["consulta_id"]
         ]
-
-
-class DatabaseFake:
-    def __init__(self, documents):
-        self.collection = CollectionFake(documents)
-
-    def get_collection(self, name):
-        if name != "agendamentos":
-            raise AssertionError(f"Unexpected collection: {name}")
-        return self.collection
 
 
 class AgendaCacheServiceTests(unittest.TestCase):
     def setUp(self):
         self.redis = RedisFake()
-        self.database = DatabaseFake(
+        self.repository = MongoRepositoryFake(
             [
                 {
                     "agendamento_id": "agendamento-1",
@@ -78,7 +72,7 @@ class AgendaCacheServiceTests(unittest.TestCase):
         )
         self.service = AgendaCacheService(
             self.redis,
-            self.database,
+            self.repository,
             tempo_expiracao=3600,
         )
         self.data = date(2026, 11, 17)
@@ -87,7 +81,7 @@ class AgendaCacheServiceTests(unittest.TestCase):
         agenda = self.service.obter_agenda_dia("medico-1", self.data)
 
         self.assertEqual(len(agenda), 1)
-        self.assertEqual(self.database.collection.aggregate_calls, 1)
+        self.assertEqual(self.repository.aggregate_calls, 1)
         self.assertEqual(
             self.redis.expirations[
                 "agenda:medico:medico-1:2026-11-17"
@@ -106,7 +100,7 @@ class AgendaCacheServiceTests(unittest.TestCase):
         second_result = self.service.obter_agenda_dia("medico-1", self.data)
 
         self.assertEqual(first_result, second_result)
-        self.assertEqual(self.database.collection.aggregate_calls, 1)
+        self.assertEqual(self.repository.aggregate_calls, 1)
 
     def test_expired_cache_is_reloaded_from_mongo(self):
         self.service.obter_agenda_dia("medico-1", self.data)
@@ -114,7 +108,7 @@ class AgendaCacheServiceTests(unittest.TestCase):
 
         self.service.obter_agenda_dia("medico-1", self.data)
 
-        self.assertEqual(self.database.collection.aggregate_calls, 2)
+        self.assertEqual(self.repository.aggregate_calls, 2)
 
     def test_invalidation_causes_next_read_to_reload_mongo(self):
         self.service.obter_agenda_dia("medico-1", self.data)
@@ -124,12 +118,12 @@ class AgendaCacheServiceTests(unittest.TestCase):
         )
         self.service.obter_agenda_dia("medico-1", self.data)
 
-        self.assertEqual(self.database.collection.aggregate_calls, 2)
+        self.assertEqual(self.repository.aggregate_calls, 2)
 
     def test_invalidar_agendas_da_consulta_removes_each_day_cache(self):
         # 01:00 UTC de 18/11 ainda é 17/11 no horário de Brasília; o PyMongo
         # sem tz_aware devolve o horário sem fuso.
-        self.database.collection.agendamentos = [
+        self.repository.agendamentos = [
             {
                 "consulta_id": "consulta-1",
                 "medico_id": "medico-1",

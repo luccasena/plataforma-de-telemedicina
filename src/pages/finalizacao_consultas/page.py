@@ -1,14 +1,16 @@
 import streamlit as st
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
-from config.database import conectar_redis, obter_banco_mongodb
+from config.database import conectar_redis, obter_mongo_repository
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
 
-prontuario_service = ProntuarioService(obter_banco_mongodb())
-fila_service = FilaService(conectar_redis())
-agenda_cache_service = AgendaCacheService(conectar_redis(), obter_banco_mongodb())
+mongo_repository = obter_mongo_repository()
+redis_client = conectar_redis()
+prontuario_service = ProntuarioService(mongo_repository)
+fila_service = FilaService(redis_client)
+agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
 
 def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
     if arquivo is None:

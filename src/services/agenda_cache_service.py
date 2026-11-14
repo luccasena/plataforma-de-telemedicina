@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, time, timedelta, timezone
 
+from repositories.mongo_repository import MongoRepository
+
 
 TEMPO_EXPIRACAO_AGENDA = 12 * 60 * 60
 FUSO_BRASILIA = timezone(timedelta(hours=-3))
@@ -19,11 +21,11 @@ class AgendaCacheService:
     def __init__(
         self,
         redis_client,
-        banco,
+        mongo_repository: MongoRepository,
         tempo_expiracao=TEMPO_EXPIRACAO_AGENDA,
     ):
         self.redis_client = redis_client
-        self.banco = banco
+        self.mongo_repository = mongo_repository
         self.tempo_expiracao = tempo_expiracao
 
     def _obter_chave(self, medico_id, data):
@@ -37,62 +39,61 @@ class AgendaCacheService:
 
         inicio = datetime.combine(data, time.min, tzinfo=FUSO_BRASILIA)
         fim = inicio + timedelta(days=1)
-        agenda = list(
-            self.banco.get_collection("agendamentos").aggregate(
-                [
-                    {
-                        "$match": {
-                            "medico_id": medico_id,
-                            "horario_inicio": {"$gte": inicio, "$lt": fim},
-                            "status": {"$in": STATUS_AGENDA_CACHE},
-                        }
-                    },
-                    {
-                        "$lookup": {
-                            "from": "prontuarios",
-                            "localField": "consulta_id",
-                            "foreignField": "consultas._id",
-                            "let": {"consulta_id": "$consulta_id"},
-                            "pipeline": [
-                                {"$unwind": "$consultas"},
-                                {
-                                    "$match": {
-                                        "$expr": {
-                                            "$eq": ["$consultas._id", "$$consulta_id"]
-                                        }
+        agenda = self.mongo_repository.aggregate(
+            "agendamentos",
+            [
+                {
+                    "$match": {
+                        "medico_id": medico_id,
+                        "horario_inicio": {"$gte": inicio, "$lt": fim},
+                        "status": {"$in": STATUS_AGENDA_CACHE},
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": "prontuarios",
+                        "localField": "consulta_id",
+                        "foreignField": "consultas._id",
+                        "let": {"consulta_id": "$consulta_id"},
+                        "pipeline": [
+                            {"$unwind": "$consultas"},
+                            {
+                                "$match": {
+                                    "$expr": {
+                                        "$eq": ["$consultas._id", "$$consulta_id"]
                                     }
-                                },
-                                {"$replaceWith": "$consultas"},
-                            ],
-                            "as": "consulta",
-                        }
-                    },
-                    {"$unwind": "$consulta"},
-                    {
-                        "$lookup": {
-                            "from": "pacientes",
-                            "localField": "paciente_id",
-                            "foreignField": "_id",
-                            "as": "paciente",
-                        }
-                    },
-                    {
-                        "$project": {
-                            "_id": 0,
-                            "agendamento_id": {"$toString": "$_id"},
-                            "consulta_id": {"$toString": "$consulta._id"},
-                            "paciente_id": {"$toString": "$paciente_id"},
-                            "paciente_nome": {"$first": "$paciente.nome"},
-                            "queixa_principal": "$consulta.queixa_principal",
-                            "horario_inicio": 1,
-                            "horario_fim": 1,
-                            "status_agendamento": "$status",
-                            "status_consulta": "$consulta.status",
-                        }
-                    },
-                    {"$sort": {"horario_inicio": 1}},
-                ]
-            )
+                                }
+                            },
+                            {"$replaceWith": "$consultas"},
+                        ],
+                        "as": "consulta",
+                    }
+                },
+                {"$unwind": "$consulta"},
+                {
+                    "$lookup": {
+                        "from": "pacientes",
+                        "localField": "paciente_id",
+                        "foreignField": "_id",
+                        "as": "paciente",
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "agendamento_id": {"$toString": "$_id"},
+                        "consulta_id": {"$toString": "$consulta._id"},
+                        "paciente_id": {"$toString": "$paciente_id"},
+                        "paciente_nome": {"$first": "$paciente.nome"},
+                        "queixa_principal": "$consulta.queixa_principal",
+                        "horario_inicio": 1,
+                        "horario_fim": 1,
+                        "status_agendamento": "$status",
+                        "status_consulta": "$consulta.status",
+                    }
+                },
+                {"$sort": {"horario_inicio": 1}},
+            ],
         )
         agenda = [self._normalizar_agendamento(item) for item in agenda]
         self.redis_client.set(
@@ -111,7 +112,8 @@ class AgendaCacheService:
         Deve ser chamado sempre que o status da consulta mudar, pois a agenda
         em cache guarda o status da consulta.
         """
-        agendamentos = self.banco.get_collection("agendamentos").find(
+        agendamentos = self.mongo_repository.find_documents(
+            "agendamentos",
             {"consulta_id": consulta_id},
             {"medico_id": 1, "horario_inicio": 1},
         )

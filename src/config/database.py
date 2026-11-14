@@ -2,6 +2,7 @@ import streamlit as st
 import redis
 from neo4j import GraphDatabase
 from pymongo import MongoClient
+from repositories.mongo_repository import MongoRepository
 
 @st.cache_resource
 def conectar_mongodb():
@@ -15,6 +16,9 @@ def obter_banco_mongodb():
     return cliente[
         st.secrets["mongodb"]["database"]
     ]
+
+def obter_mongo_repository():
+    return MongoRepository(obter_banco_mongodb())
 
 @st.cache_resource
 def conectar_redis():
