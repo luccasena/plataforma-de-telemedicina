@@ -2,7 +2,7 @@
 
 ## Infraestrutura local
 
-Para iniciar MongoDB, Redis e Neo4j:
+Para iniciar PostgreSQL, MongoDB, Redis e Neo4j:
 
 ```bash
 docker compose up -d
@@ -10,12 +10,24 @@ docker compose up -d
 
 ## Gerar dados iniciais
 
-Com os containers em execução, gere as coleções, os validadores e os dados de
-exemplo no MongoDB e no Neo4j. O mesmo script também recarrega no Redis o cache
-das agendas futuras:
+Com os containers em execução, gere a tabela de usuários no PostgreSQL, as
+coleções (incluindo a de detalhes dos médicos), os validadores e os dados de
+exemplo no MongoDB e o grafo no Neo4j. O mesmo script também carrega no Redis
+o cache das agendas futuras:
 
 ```bash
 python src/config/seed.py
+```
+
+O script apaga os dados existentes e recria tudo a cada execução. Como ele
+também zera o Redis (fila, sessões e cache), é preciso entrar de novo no app.
+
+Se você tem os bancos de uma versão anterior do projeto, apague os volumes e
+suba os containers de novo antes de rodar o script:
+
+```bash
+docker compose down -v
+docker compose up -d
 ```
 
 ## Executar localmente (Windows PowerShell)
@@ -53,13 +65,53 @@ python -m unittest discover -s src/tests -v
 
 Serviços disponíveis:
 
+- PostgreSQL: `localhost:5433` (a porta 5432 fica livre para um PostgreSQL
+  instalado na máquina)
 - MongoDB: `localhost:27018`
 - Redis: `localhost:6379`
 - Neo4j Browser: `http://localhost:7474`
 - Neo4j Bolt: `bolt://localhost:7687`
 
-As credenciais podem ser sobrescritas com as variáveis `MONGO_ROOT_USER`,
-`MONGO_ROOT_PASSWORD`, `REDIS_PASSWORD` e `NEO4J_AUTH`.
+As credenciais podem ser sobrescritas com as variáveis `POSTGRES_USER`,
+`POSTGRES_PASSWORD`, `POSTGRES_DB`, `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`,
+`REDIS_PASSWORD` e `NEO4J_AUTH`.
+
+## Usuários no PostgreSQL e detalhes dos médicos no MongoDB
+
+A tabela `usuarios` do PostgreSQL, criada pelo `seed.py`, guarda só os dados
+usados no acesso à aplicação, de médicos e recepcionistas: `nome`, `cpf`,
+`email`, `senha`, `cargo` e `status`. CPF e e-mail são únicos. O `id` (`BIGINT`
+gerado pelo banco) é a referência usada pelos outros bancos:
+
+- MongoDB: `usuario_id` na coleção `medicos` e `medico_id` em
+  `prontuarios.consultas` e em `agendamentos`;
+- Redis: `usuario_id` da sessão e a chave `agenda:medico:<id>:<AAAA-MM-DD>`;
+- Neo4j: propriedade `postgres_id` dos nós `(:Medico)`.
+
+Os detalhes de cada médico ficam na coleção `medicos` do MongoDB:
+
+| Campo | Tipo | Obrigatório |
+|---|---|---|
+| `usuario_id` | inteiro: o `id` do médico na tabela `usuarios` | sim |
+| `crm` | texto | sim |
+| `uf_crm` | texto com 2 letras | sim |
+| `telefone` | inteiro | sim |
+| `especialidades` | lista de textos | não |
+| `data_cadastro` | data | não |
+
+O validador da coleção recusa documentos sem `usuario_id` (ou com valor que não
+seja inteiro positivo). O índice único em `usuario_id` garante um documento por
+médico, e o índice único em (`crm`, `uf_crm`) impede CRM repetido na mesma UF.
+
+O `UsuarioService` faz o login e busca os nomes dos médicos exibidos nas
+consultas no PostgreSQL, já que o MongoDB não consegue fazer `$lookup` em uma
+tabela do PostgreSQL. Para listar os médicos, junta os da tabela com o CRM da
+coleção `medicos`. O `criar_medico` grava o usuário e os detalhes na mesma
+transação do PostgreSQL: se a gravação no MongoDB falhar, o usuário não é
+criado.
+
+Quem já tinha o `.streamlit/secrets.toml` precisa acrescentar a ele a seção
+`[postgres]` do `.streamlit/secrets-example.toml`.
 
 ## Recepção Virtual: fila e agenda
 
@@ -89,7 +141,7 @@ agendamento ou o status de uma consulta mudar:
   cache de todos os dias em que a consulta está agendada. É chamado ao chamar o
   próximo paciente e ao finalizar a consulta.
 
-O `seed.py` descarta e recarrega o cache das agendas futuras.
+O `seed.py` zera o Redis e carrega o cache das agendas futuras.
 
 ## Finalização de Consultas
 
@@ -108,7 +160,8 @@ Ao finalizar uma consulta:
 Métodos usados (`ProntuarioService`):
 
 - `obter_consultas_em_andamento()`: aggregate com `$unwind`, `$match` e
-  `$lookup` para trazer as consultas em andamento com paciente e médico.
+  `$lookup` para trazer as consultas em andamento com o paciente; o nome do
+  médico vem da tabela `usuarios` do PostgreSQL.
 - `finalizar_consulta(paciente_id, consulta_id, arquivo, receita)`: grava o
   laudo e conclui a consulta. Retorna `False` se a consulta não estiver mais em
   andamento.
@@ -137,7 +190,7 @@ Métodos:
 
 ## Sessões de usuários no Redis
 
-Após o login validado no MongoDB, o sistema cria um token aleatório e armazena
+Após o login validado no PostgreSQL, o sistema cria um token aleatório e armazena
 no Redis somente o hash desse token. A sessão usa a chave
 `sessao:<hash_do_token>`, contém os dados mínimos do usuário e expira após 8
 horas. Cada validação renova o TTL; o botão `Sair` revoga a sessão removendo a
