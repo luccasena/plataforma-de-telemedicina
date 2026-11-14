@@ -1,9 +1,10 @@
 """
-Seed da plataforma de telemedicina (MongoDB + Neo4j).
+Seed da plataforma de telemedicina (MongoDB + Neo4j + Redis).
 
 1. MongoDB: cria (ou atualiza) as coleções pacientes, usuarios, prontuarios e
    agendamentos com validação $jsonSchema, cria os índices e insere dados de
-   exemplo. A coleção usuarios reúne médicos e recepcionistas.
+   exemplo. A coleção usuarios reúne médicos e recepcionistas. Cada
+   agendamento aponta para a consulta do prontuário pelo campo consulta_id.
 2. Neo4j: lê o que está no MongoDB (a fonte da verdade) e monta o grafo de
    histórico epidemiológico e interações clínicas:
 
@@ -11,26 +12,39 @@ Seed da plataforma de telemedicina (MongoDB + Neo4j).
        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)
        (:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)
 
+3. Redis: descarta o cache das agendas e o recarrega com as agendas futuras.
+
 Pode ser executado várias vezes sem duplicar nada: no MongoDB cada documento
 é substituído pela sua chave natural (CPF, CRM, paciente, horário) e no Neo4j
 o histórico de cada paciente é reconstruído a partir do prontuário.
 
-Uso, na raiz do projeto, com os containers do MongoDB e do Neo4j no ar:
+Uso, na raiz do projeto, com os containers do MongoDB, do Neo4j e do Redis no ar:
     python src/config/seed.py
     python src/config/seed.py --reset    # apaga coleções e grafo antes de recriar
 """
 
 import argparse
 import re
+import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import redis
 from bson import Binary, ObjectId
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 from pymongo import ASCENDING, IndexModel, MongoClient, ReturnDocument
 from pymongo.errors import ServerSelectionTimeoutError
+from redis.exceptions import RedisError
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from repositories.mongo_repository import MongoRepository  # noqa: E402
+from services.agenda_cache_service import (  # noqa: E402
+    PREFIXO_AGENDA,
+    STATUS_AGENDA_CACHE,
+    AgendaCacheService,
+)
 
 ARQUIVO_SECRETS = Path(__file__).resolve().parents[2] / ".streamlit" / "secrets.toml"
 
@@ -157,15 +171,30 @@ VALIDADORES = {
         },
         obrigatorios=["paciente_id"],
     ),
-    "agendamentos": esquema(
-        {
-            "paciente_id": ID,
-            "medico_id": ID,
-            "horario_inicio": DATA,
-            "horario_fim": DATA,
-            "status": {"enum": STATUS_AGENDAMENTO},
+    "agendamentos": {
+        "$jsonSchema": {
+            "bsonType": "object",
+            "properties": {
+                "paciente_id": ID,
+                "medico_id": ID,
+                "consulta_id": ID,
+                "horario_inicio": DATA,
+                "horario_fim": DATA,
+                "status": {"enum": STATUS_AGENDAMENTO},
+            },
+            "required": ["paciente_id", "medico_id", "horario_inicio", "horario_fim"],
+            # Agendamento que ainda vai acontecer precisa apontar para a
+            # consulta do prontuário. O histórico antigo pode não ter consulta.
+            "anyOf": [
+                {
+                    "properties": {
+                        "status": {"enum": ["concluido", "cancelado", "nao_compareceu"]}
+                    }
+                },
+                {"required": ["consulta_id"]},
+            ],
         }
-    ),
+    },
 }
 
 INDICES = {
@@ -182,10 +211,12 @@ INDICES = {
     "prontuarios": [
         IndexModel([("paciente_id", ASCENDING)], unique=True),
         IndexModel([("consultas.medico_id", ASCENDING)]),
+        IndexModel([("consultas._id", ASCENDING)]),
     ],
     "agendamentos": [
         IndexModel([("medico_id", ASCENDING), ("horario_inicio", ASCENDING)]),
         IndexModel([("paciente_id", ASCENDING), ("horario_inicio", ASCENDING)]),
+        IndexModel([("consulta_id", ASCENDING)]),
     ],
 }
 
@@ -290,10 +321,10 @@ def laudo_texto(conteudo):
     return Binary(conteudo.encode("utf-8"))
 
 
-def montar_prontuarios(pacientes, medicos):
-    consulta_ana = ObjectId()
-    consulta_carlos_1 = ObjectId()
-    consulta_carlos_2 = ObjectId()
+def montar_prontuarios(pacientes, medicos, consultas):
+    consulta_ana = consultas["ana"]
+    consulta_carlos_1 = consultas["carlos_1"]
+    consulta_carlos_2 = consultas["carlos_2"]
     agora = datetime.now(timezone.utc)
 
     return [
@@ -383,24 +414,34 @@ def montar_prontuarios(pacientes, medicos):
     ]
 
 
-def montar_agendamentos(pacientes, medicos):
-    def agendamento(paciente, medico, inicio, status, duracao_min=30):
-        return {
+def montar_agendamentos(pacientes, medicos, consultas):
+    def agendamento(paciente, medico, inicio, status, consulta=None, duracao_min=30):
+        documento = {
             "paciente_id": pacientes[paciente],
             "medico_id": medicos[medico],
             "horario_inicio": inicio,
             "horario_fim": inicio + timedelta(minutes=duracao_min),
             "status": status,
         }
+        if consulta is not None:
+            documento["consulta_id"] = consultas[consulta]
+        return documento
 
     return [
+        # Histórico anterior às consultas do prontuário: sem consulta associada.
         agendamento("ana", "joao", horario(2026, 10, 20, 9), "concluido"),
         agendamento("carlos", "fernanda", horario(2026, 10, 22, 14), "concluido"),
         agendamento("carlos", "fernanda", horario(2026, 11, 5, 14), "concluido"),
         agendamento("mariana", "joao", horario(2026, 11, 3, 10), "nao_compareceu"),
-        agendamento("ana", "joao", horario(2026, 11, 10, 9), "cancelado"),
-        agendamento("ana", "joao", horario(2026, 11, 17, 9), "confirmado"),
-        agendamento("carlos", "fernanda", horario(2026, 12, 3, 15), "confirmado"),
+        # A consulta da Ana foi remarcada de 10/11 para 17/11.
+        agendamento("ana", "joao", horario(2026, 11, 10, 9), "cancelado", "ana"),
+        agendamento("ana", "joao", horario(2026, 11, 17, 9), "confirmado", "ana"),
+        agendamento(
+            "carlos", "fernanda", horario(2026, 11, 19, 14), "confirmado", "carlos_1"
+        ),
+        agendamento(
+            "carlos", "fernanda", horario(2026, 12, 3, 15), "confirmado", "carlos_2"
+        ),
     ]
 
 
@@ -642,6 +683,21 @@ def conectar_neo4j(config):
     return driver
 
 
+def conectar_redis(config):
+    cliente = redis.Redis.from_url(
+        config["url"], decode_responses=True, socket_connect_timeout=5
+    )
+    try:
+        cliente.ping()
+    except RedisError:
+        cliente.close()
+        raise SystemExit(
+            "Não foi possível conectar ao Redis. "
+            "Suba o container com: docker compose up -d redis"
+        )
+    return cliente
+
+
 def preparar_colecao(db, nome):
     if nome in db.list_collection_names():
         db.command("collMod", nome, validator=VALIDADORES[nome])
@@ -675,9 +731,10 @@ def semear(db):
     }
     for doc in RECEPCIONISTAS.values():
         salvar(db.usuarios, {"cpf": doc["cpf"]}, doc)
-    for prontuario in montar_prontuarios(pacientes, medicos):
+    consultas = {chave: ObjectId() for chave in ("ana", "carlos_1", "carlos_2")}
+    for prontuario in montar_prontuarios(pacientes, medicos, consultas):
         salvar(db.prontuarios, {"paciente_id": prontuario["paciente_id"]}, prontuario)
-    for agendamento in montar_agendamentos(pacientes, medicos):
+    for agendamento in montar_agendamentos(pacientes, medicos, consultas):
         filtro = {
             campo: agendamento[campo]
             for campo in ("paciente_id", "medico_id", "horario_inicio")
@@ -685,7 +742,31 @@ def semear(db):
         salvar(db.agendamentos, filtro, agendamento)
 
 
-def imprimir_resumo(db, driver, banco_neo4j):
+def recarregar_cache_agendas(db, redis_client):
+    """Descarta o cache das agendas e o recarrega com as agendas futuras.
+
+    O cache é descartado porque os ids das consultas mudam a cada execução.
+    """
+    for chave in redis_client.scan_iter(match=f"{PREFIXO_AGENDA}*"):
+        redis_client.delete(chave)
+
+    cache = AgendaCacheService(redis_client, MongoRepository(db))
+    agendamentos = db.agendamentos.find(
+        {
+            "status": {"$in": STATUS_AGENDA_CACHE},
+            "horario_inicio": {"$gte": datetime.now(FUSO_BRASILIA)},
+        },
+        {"medico_id": 1, "horario_inicio": 1},
+    )
+    agendas = {
+        (item["medico_id"], item["horario_inicio"].astimezone(FUSO_BRASILIA).date())
+        for item in agendamentos
+    }
+    for medico_id, dia_agenda in sorted(agendas, key=lambda item: (str(item[0]), item[1])):
+        cache.obter_agenda_dia(medico_id, dia_agenda)
+
+
+def imprimir_resumo(db, driver, banco_neo4j, redis_client):
     print(f"MongoDB ({db.name}):")
     for nome in VALIDADORES:
         print(f"  {nome}: {db[nome].count_documents({})} documento(s)")
@@ -702,6 +783,10 @@ def imprimir_resumo(db, driver, banco_neo4j):
         )
         print(f"  [:{tipo}]: {registros[0]['total']} relação(ões)")
 
+    agendas = sum(1 for _ in redis_client.scan_iter(match=f"{PREFIXO_AGENDA}*"))
+    print("Redis:")
+    print(f"  agendas em cache: {agendas}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -717,10 +802,12 @@ def main():
     secrets = carregar_secrets()
     banco_neo4j = secrets["neo4j"].get("database", "neo4j")
 
-    # Conecta nos dois bancos antes de gravar qualquer coisa.
-    with conectar_mongodb(secrets["mongodb"]) as cliente, conectar_neo4j(
-        secrets["neo4j"]
-    ) as driver:
+    # Conecta nos três bancos antes de gravar qualquer coisa.
+    with (
+        conectar_mongodb(secrets["mongodb"]) as cliente,
+        conectar_neo4j(secrets["neo4j"]) as driver,
+        conectar_redis(secrets["redis"]) as redis_client,
+    ):
         db = cliente[secrets["mongodb"]["database"]]
         if args.reset:
             for nome in VALIDADORES:
@@ -731,8 +818,9 @@ def main():
             preparar_colecao(db, nome)
         semear(db)
         sincronizar_neo4j(db, driver, banco_neo4j)
+        recarregar_cache_agendas(db, redis_client)
 
-        imprimir_resumo(db, driver, banco_neo4j)
+        imprimir_resumo(db, driver, banco_neo4j, redis_client)
 
 
 if __name__ == "__main__":
