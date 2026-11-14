@@ -81,7 +81,8 @@ token_sessao = st.session_state.get("token_sessao")
 usuario_sessao = sessao_service.obter_usuario(token_sessao)
 
 if usuario_sessao is None:
-    st.session_state.clear()
+    if token_sessao:
+        st.session_state.clear()
     exibir_login()
 else:
     st.session_state["usuario"] = usuario_sessao
