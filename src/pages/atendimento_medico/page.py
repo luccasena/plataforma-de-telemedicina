@@ -1,21 +1,22 @@
 import streamlit as st
+from psycopg import Error as PostgresError
 from pymongo.errors import PyMongoError
 from services.paciente_service import PacienteService
-from config.database import obter_mongo_repository
+from config.database import obter_mongo_repository, obter_postgres_repository
 from services.prontuario_service import ProntuarioService
 from services.usuario_service import UsuarioService
 
 mongo_repository = obter_mongo_repository()
 paciente_service = PacienteService(mongo_repository)
-prontuario_service = ProntuarioService(mongo_repository)
-usuario_service = UsuarioService(mongo_repository)
+usuario_service = UsuarioService(obter_postgres_repository(), mongo_repository)
+prontuario_service = ProntuarioService(mongo_repository, usuario_service)
 
 @st.dialog("Criar consulta")
 def _criar_consulta_modal():
     try:
         medicos = usuario_service.obter_medicos()
         pacientes = paciente_service.obter_pacientes()
-    except PyMongoError:
+    except (PyMongoError, PostgresError):
         st.error("Não foi possível carregar os usuários.")
         return
 
@@ -46,7 +47,7 @@ def _criar_consulta_modal():
         st.warning("Nenhum médico ativo cadastrado.")
         return
     opcoes_medicos = {
-        f"{medico['nome']} - CRM: {medico.get('crm', 'não informado')}": medico["_id"]
+        f"{medico['nome']} - CRM: {medico.get('crm', 'não informado')}": medico["id"]
         for medico in medicos
     }
     medico_id = opcoes_medicos[st.selectbox("Médico responsável", list(opcoes_medicos))]

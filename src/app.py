@@ -1,10 +1,16 @@
 import streamlit as st
-from pymongo.errors import PyMongoError
+from psycopg import Error as PostgresError
 from services.usuario_service import UsuarioService
-from config.database import conectar_redis, obter_mongo_repository
+from config.database import (
+    conectar_redis,
+    obter_mongo_repository,
+    obter_postgres_repository,
+)
 from services.sessao_service import SessaoService
 
-usuario_service = UsuarioService(obter_mongo_repository())
+usuario_service = UsuarioService(
+    obter_postgres_repository(), obter_mongo_repository()
+)
 sessao_service = SessaoService(conectar_redis())
 
 def exibir_login():
@@ -25,7 +31,7 @@ def exibir_login():
 
     try:
         usuario = usuario_service.autenticar(email, senha)
-    except PyMongoError:
+    except PostgresError:
         st.error("Não foi possível verificar o login. Tente novamente.")
         return
 

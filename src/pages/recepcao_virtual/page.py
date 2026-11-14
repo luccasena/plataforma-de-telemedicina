@@ -3,10 +3,15 @@ from datetime import date, datetime, timedelta, timezone
 import streamlit as st
 from bson import ObjectId
 from bson.errors import InvalidId
+from psycopg import Error as PostgresError
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
 
-from config.database import conectar_redis, obter_mongo_repository
+from config.database import (
+    conectar_redis,
+    obter_mongo_repository,
+    obter_postgres_repository,
+)
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
@@ -18,8 +23,8 @@ mongo_repository = obter_mongo_repository()
 redis_client = conectar_redis()
 fila_service = FilaService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
-prontuario_service = ProntuarioService(mongo_repository)
-usuario_service = UsuarioService(mongo_repository)
+usuario_service = UsuarioService(obter_postgres_repository(), mongo_repository)
+prontuario_service = ProntuarioService(mongo_repository, usuario_service)
 
 
 def _formatar_horario(valor):
@@ -143,7 +148,7 @@ def _exibir_agenda(medicos):
         medicos_visiveis = [
             medico
             for medico in medicos
-            if str(medico["_id"]) == usuario.get("usuario_id")
+            if str(medico["id"]) == usuario.get("usuario_id")
         ]
         if not medicos_visiveis:
             st.warning("Não foi possível localizar o médico da sessão.")
@@ -156,7 +161,7 @@ def _exibir_agenda(medicos):
     medico = opcoes[st.selectbox("Médico", list(opcoes))]
     dia_agenda = st.date_input("Data", value=date.today(), key="agenda_data")
     try:
-        agenda = agenda_cache_service.obter_agenda_dia(medico["_id"], dia_agenda)
+        agenda = agenda_cache_service.obter_agenda_dia(medico["id"], dia_agenda)
     except (PyMongoError, RedisError):
         st.error("Não foi possível carregar a agenda do dia.")
         return
@@ -224,7 +229,7 @@ def _exibir_painel():
         _exibir_agenda(medicos)
         _exibir_consultas_ativas()
         _exibir_sessoes_ativas()
-    except PyMongoError:
+    except (PyMongoError, PostgresError):
         st.error("Não foi possível carregar os dados da recepção.")
     except RedisError:
         st.error("Não foi possível acessar a fila no Redis.")

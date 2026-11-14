@@ -21,7 +21,7 @@ class SessaoService:
         self.redis_client.hset(
             chave,
             mapping={
-                "usuario_id": str(usuario["_id"]),
+                "usuario_id": str(usuario["id"]),
                 "nome": usuario["nome"],
                 "email": usuario["email"],
                 "cargo": usuario["cargo"],

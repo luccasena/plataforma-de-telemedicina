@@ -1,40 +1,42 @@
 """
-Seed da plataforma de telemedicina (MongoDB + Neo4j + Redis).
+Seed da plataforma de telemedicina (PostgreSQL + MongoDB + Neo4j + Redis).
 
-1. MongoDB: cria (ou atualiza) as coleções pacientes, usuarios, prontuarios e
-   agendamentos com validação $jsonSchema, cria os índices e insere dados de
-   exemplo. A coleção usuarios reúne médicos e recepcionistas. Cada
-   agendamento aponta para a consulta do prontuário pelo campo consulta_id.
-2. Neo4j: lê o que está no MongoDB (a fonte da verdade) e monta o grafo de
-   histórico epidemiológico e interações clínicas:
+Apaga os dados existentes e recria tudo com os dados de exemplo:
+
+1. PostgreSQL: tabela usuarios, com os dados de acesso de médicos e
+   recepcionistas (nome, CPF, e-mail, senha, cargo e status).
+2. MongoDB: coleções medicos, pacientes, prontuarios e agendamentos, com
+   validação $jsonSchema e índices. A coleção medicos guarda os detalhes de
+   cada médico (CRM, telefone, especialidades e data de cadastro) e o
+   usuario_id, que é o id do médico na tabela usuarios. O medico_id dos
+   prontuários e agendamentos também é esse id. Cada agendamento aponta para a
+   consulta do prontuário pelo campo consulta_id.
+3. Neo4j: grafo de histórico epidemiológico e interações clínicas, montado a
+   partir do PostgreSQL e do MongoDB:
 
        (:Medico)-[:ATENDEU]->(:Paciente)
        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)
        (:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)
 
-3. Redis: descarta o cache das agendas e o recarrega com as agendas futuras.
+4. Redis: apaga fila, sessões e cache e carrega o cache das agendas futuras.
 
-Pode ser executado várias vezes sem duplicar nada: no MongoDB cada documento
-é substituído pela sua chave natural (CPF, CRM, paciente, horário) e no Neo4j
-o histórico de cada paciente é reconstruído a partir do prontuário.
-
-Uso, na raiz do projeto, com os containers do MongoDB, do Neo4j e do Redis no ar:
+Uso, na raiz do projeto, com os containers no ar:
     python src/config/seed.py
-    python src/config/seed.py --reset    # apaga coleções e grafo antes de recriar
 """
 
-import argparse
 import re
 import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import psycopg
 import redis
 from bson import Binary, ObjectId
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
-from pymongo import ASCENDING, IndexModel, MongoClient, ReturnDocument
+from psycopg.rows import dict_row
+from pymongo import ASCENDING, IndexModel, MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
 from redis.exceptions import RedisError
 
@@ -61,7 +63,29 @@ STATUS_AGENDAMENTO = [
 STATUS_CONSULTA = ["Agendado", "Em andamento", "Concluído"]
 
 # --------------------------------------------------------------------------
-# Esquemas de validação
+# Tabela de usuários no PostgreSQL
+# --------------------------------------------------------------------------
+
+SQL_TABELA_USUARIOS = """
+CREATE TABLE usuarios (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nome TEXT NOT NULL,
+    cpf VARCHAR(11) NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE,
+    senha TEXT NOT NULL,
+    cargo TEXT NOT NULL CHECK (cargo IN ('Medico', 'Recepcionista')),
+    status TEXT NOT NULL DEFAULT 'Ativo' CHECK (status IN ('Ativo', 'Inativo'))
+)
+"""
+
+SQL_INSERIR_USUARIO = """
+INSERT INTO usuarios (nome, cpf, email, senha, cargo, status)
+VALUES (%(nome)s, %(cpf)s, %(email)s, %(senha)s, %(cargo)s, %(status)s)
+RETURNING id
+"""
+
+# --------------------------------------------------------------------------
+# Esquemas de validação do MongoDB
 # --------------------------------------------------------------------------
 
 TEXTO = {"bsonType": "string"}
@@ -69,6 +93,7 @@ DATA = {"bsonType": "date"}
 INTEIRO = {"bsonType": ["int", "long"]}
 ID = {"bsonType": "objectId"}
 LISTA_DE_TEXTO = {"bsonType": "array", "items": TEXTO}
+ID_USUARIO = {"bsonType": ["int", "long"], "minimum": 1}  # id na tabela usuarios
 
 
 def lista_de(propriedades, obrigatorios=()):
@@ -86,6 +111,17 @@ def esquema(propriedades, obrigatorios=()):
 
 
 VALIDADORES = {
+    "medicos": esquema(
+        {
+            "usuario_id": ID_USUARIO,
+            "crm": TEXTO,
+            "uf_crm": {"bsonType": "string", "minLength": 2, "maxLength": 2},
+            "telefone": INTEIRO,
+            "especialidades": LISTA_DE_TEXTO,
+            "data_cadastro": DATA,
+        },
+        obrigatorios=["usuario_id", "crm", "uf_crm", "telefone"],
+    ),
     "pacientes": esquema(
         {
             "nome": TEXTO,
@@ -101,46 +137,13 @@ VALIDADORES = {
         },
         obrigatorios=["nome", "cpf", "telefone", "email", "status"],
     ),
-    "usuarios": {
-        "$jsonSchema": {
-            "bsonType": "object",
-            "properties": {
-                "nome": TEXTO,
-                "cpf": TEXTO,
-                "cargo": {"enum": ["Medico", "Recepcionista"]},
-                "crm": TEXTO,
-                "uf_crm": TEXTO,
-                "telefone": INTEIRO,
-                "email": TEXTO,
-                "senha": TEXTO,
-                "especialidades": LISTA_DE_TEXTO,
-                "status": {"enum": STATUS_CADASTRO},
-                "data_cadastro": DATA,
-            },
-            "required": [
-                "nome",
-                "cpf",
-                "cargo",
-                "telefone",
-                "email",
-                "senha",
-                "status",
-            ],
-            "oneOf": [
-                {"properties": {"cargo": {"enum": ["Medico"]}}, "required": ["crm"]},
-                {
-                    "properties": {"cargo": {"enum": ["Recepcionista"]}},
-                },
-            ],
-        }
-    },
     "prontuarios": esquema(
         {
             "paciente_id": ID,
             "consultas": lista_de(
                 {
                     "_id": ID,
-                    "medico_id": ID,
+                    "medico_id": ID_USUARIO,
                     "queixa_principal": TEXTO,
                     "sintomas": LISTA_DE_TEXTO,
                     "diagnosticos": LISTA_DE_TEXTO,
@@ -176,7 +179,7 @@ VALIDADORES = {
             "bsonType": "object",
             "properties": {
                 "paciente_id": ID,
-                "medico_id": ID,
+                "medico_id": ID_USUARIO,
                 "consulta_id": ID,
                 "horario_inicio": DATA,
                 "horario_fim": DATA,
@@ -198,16 +201,12 @@ VALIDADORES = {
 }
 
 INDICES = {
-    "pacientes": [IndexModel([("cpf", ASCENDING)], unique=True)],
-    "usuarios": [
-        IndexModel([("cpf", ASCENDING)], unique=True),
-        IndexModel([("email", ASCENDING)], unique=True),
-        IndexModel(
-            [("crm", ASCENDING), ("uf_crm", ASCENDING)],
-            unique=True,
-            partialFilterExpression={"cargo": "Medico"},
-        ),
+    "medicos": [
+        # Um documento por médico: o usuario_id é a ligação com o PostgreSQL.
+        IndexModel([("usuario_id", ASCENDING)], unique=True),
+        IndexModel([("crm", ASCENDING), ("uf_crm", ASCENDING)], unique=True),
     ],
+    "pacientes": [IndexModel([("cpf", ASCENDING)], unique=True)],
     "prontuarios": [
         IndexModel([("paciente_id", ASCENDING)], unique=True),
         IndexModel([("consultas.medico_id", ASCENDING)]),
@@ -234,6 +233,56 @@ def horario(ano, mes, dia_do_mes, hora, minuto=0):
     """Horário local de Brasília (o MongoDB converte para UTC)."""
     return datetime(ano, mes, dia_do_mes, hora, minuto, tzinfo=FUSO_BRASILIA)
 
+
+# Cada médico tem os dados de acesso (tabela usuarios) e os detalhes (coleção
+# medicos).
+MEDICOS = {
+    "joao": {
+        "usuario": {
+            "nome": "Dr. João Pedro Almeida",
+            "cpf": "82634512070",
+            "email": "joao.almeida@example.com",
+            "senha": "senha123",
+            "cargo": "Medico",
+            "status": "Ativo",
+        },
+        "detalhes": {
+            "crm": "123456",
+            "uf_crm": "SP",
+            "telefone": 5511976543210,
+            "especialidades": ["Clínica Médica", "Neurologia"],
+            "data_cadastro": dia(2025, 10, 1),
+        },
+    },
+    "fernanda": {
+        "usuario": {
+            "nome": "Dra. Fernanda Ribeiro",
+            "cpf": "46172839005",
+            "email": "fernanda.ribeiro@example.com",
+            "senha": "senha123",
+            "cargo": "Medico",
+            "status": "Ativo",
+        },
+        "detalhes": {
+            "crm": "654321",
+            "uf_crm": "RJ",
+            "telefone": 5521987001122,
+            "especialidades": ["Cardiologia"],
+            "data_cadastro": dia(2025, 12, 10),
+        },
+    },
+}
+
+RECEPCIONISTAS = [
+    {
+        "nome": "Beatriz Martins",
+        "cpf": "28749613004",
+        "email": "beatriz.martins@example.com",
+        "senha": "senha123",
+        "cargo": "Recepcionista",
+        "status": "Ativo",
+    }
+]
 
 PACIENTES = {
     "ana": {
@@ -274,57 +323,12 @@ PACIENTES = {
     },
 }
 
-MEDICOS = {
-    "joao": {
-        "nome": "Dr. João Pedro Almeida",
-        "cpf": "82634512070",
-        "cargo": "Medico",
-        "crm": "123456",
-        "uf_crm": "SP",
-        "telefone": 5511976543210,
-        "email": "joao.almeida@example.com",
-        "senha": "senha123",
-        "especialidades": ["Clínica Médica", "Neurologia"],
-        "status": "Ativo",
-        "data_cadastro": dia(2025, 10, 1),
-    },
-    "fernanda": {
-        "nome": "Dra. Fernanda Ribeiro",
-        "cpf": "46172839005",
-        "cargo": "Medico",
-        "crm": "654321",
-        "uf_crm": "RJ",
-        "telefone": 5521987001122,
-        "email": "fernanda.ribeiro@example.com",
-        "senha": "senha123",
-        "especialidades": ["Cardiologia"],
-        "status": "Ativo",
-        "data_cadastro": dia(2025, 12, 10),
-    },
-}
-
-RECEPCIONISTAS = {
-    "beatriz": {
-        "nome": "Beatriz Martins",
-        "cpf": "28749613004",
-        "cargo": "Recepcionista",
-        "telefone": 5511987654321,
-        "email": "beatriz.martins@example.com",
-        "senha": "senha123",
-        "status": "Ativo",
-        "data_cadastro": dia(2026, 1, 5),
-    }
-}
-
 
 def laudo_texto(conteudo):
     return Binary(conteudo.encode("utf-8"))
 
 
 def montar_prontuarios(pacientes, medicos, consultas):
-    consulta_ana = consultas["ana"]
-    consulta_carlos_1 = consultas["carlos_1"]
-    consulta_carlos_2 = consultas["carlos_2"]
     agora = datetime.now(timezone.utc)
 
     return [
@@ -332,7 +336,7 @@ def montar_prontuarios(pacientes, medicos, consultas):
             "paciente_id": pacientes["ana"],
             "consultas": [
                 {
-                    "_id": consulta_ana,
+                    "_id": consultas["ana"],
                     "medico_id": medicos["joao"],
                     "queixa_principal": "Dor de cabeça recorrente há duas semanas",
                     "sintomas": ["Cefaleia pulsátil", "Fotofobia", "Náusea"],
@@ -369,7 +373,7 @@ def montar_prontuarios(pacientes, medicos, consultas):
             "paciente_id": pacientes["carlos"],
             "consultas": [
                 {
-                    "_id": consulta_carlos_1,
+                    "_id": consultas["carlos_1"],
                     "medico_id": medicos["fernanda"],
                     "queixa_principal": "Palpitações e cansaço aos esforços",
                     "sintomas": ["Palpitação", "Dispneia aos esforços"],
@@ -391,7 +395,7 @@ def montar_prontuarios(pacientes, medicos, consultas):
                     ],
                 },
                 {
-                    "_id": consulta_carlos_2,
+                    "_id": consultas["carlos_2"],
                     "medico_id": medicos["fernanda"],
                     "queixa_principal": "Retorno para avaliação do eletrocardiograma",
                     "sintomas": [],
@@ -455,43 +459,32 @@ RELACIONAMENTOS = ["ATENDEU", "DIAGNOSTICADO_COM", "RECEBEU_PRESCRICAO"]
 RESTRICOES_NEO4J = [
     "CREATE CONSTRAINT paciente_mongo_id IF NOT EXISTS "
     "FOR (n:Paciente) REQUIRE n.mongo_id IS UNIQUE",
-    "CREATE CONSTRAINT medico_mongo_id IF NOT EXISTS "
-    "FOR (n:Medico) REQUIRE n.mongo_id IS UNIQUE",
+    "CREATE CONSTRAINT medico_postgres_id IF NOT EXISTS "
+    "FOR (n:Medico) REQUIRE n.postgres_id IS UNIQUE",
     "CREATE CONSTRAINT diagnostico_codigo IF NOT EXISTS "
     "FOR (n:Diagnostico) REQUIRE n.codigo IS UNIQUE",
     "CREATE CONSTRAINT medicamento_nome IF NOT EXISTS "
     "FOR (n:Medicamento) REQUIRE n.nome IS UNIQUE",
 ]
 
-CYPHER_LIMPAR_GRAFO = """
-MATCH (n:Paciente|Medico|Diagnostico|Medicamento)
-DETACH DELETE n
-"""
+CYPHER_LIMPAR_GRAFO = "MATCH (n) DETACH DELETE n"
 
 CYPHER_PACIENTES = """
 UNWIND $linhas AS linha
-MERGE (p:Paciente {mongo_id: linha.mongo_id})
+CREATE (p:Paciente {mongo_id: linha.mongo_id})
 SET p += linha.dados
 """
 
 CYPHER_MEDICOS = """
 UNWIND $linhas AS linha
-MERGE (m:Medico {mongo_id: linha.mongo_id})
+CREATE (m:Medico {postgres_id: linha.postgres_id})
 SET m += linha.dados
-"""
-
-# O histórico clínico é sempre reconstruído a partir do prontuário: apaga as
-# relações do paciente e recria, refletindo inclusive o que saiu do MongoDB.
-CYPHER_LIMPAR_HISTORICO = """
-UNWIND $pacientes AS paciente_id
-MATCH (:Paciente {mongo_id: paciente_id})-[r:ATENDEU|DIAGNOSTICADO_COM|RECEBEU_PRESCRICAO]-()
-DELETE r
 """
 
 CYPHER_ATENDIMENTOS = """
 UNWIND $linhas AS linha
 MATCH (p:Paciente {mongo_id: linha.paciente_id})
-MATCH (m:Medico {mongo_id: linha.medico_id})
+MATCH (m:Medico {postgres_id: linha.medico_id})
 CREATE (m)-[:ATENDEU {
     consulta_id: linha.consulta_id,
     queixa_principal: linha.queixa_principal,
@@ -535,15 +528,9 @@ def separar_cid(diagnostico):
     return texto, None
 
 
-def texto_id(valor):
-    return str(valor) if valor is not None else None
-
-
 def ler_pacientes(db):
     linhas = []
-    for p in db.pacientes.find(
-        {}, {"nome": 1, "sexo": 1, "data_nascimento": 1, "alergias": 1, "status": 1}
-    ):
+    for p in db.pacientes.find():
         nascimento = p.get("data_nascimento")
         linhas.append(
             {
@@ -560,43 +547,43 @@ def ler_pacientes(db):
     return linhas
 
 
-def ler_medicos(db):
-    return [
-        {
-            "mongo_id": str(m["_id"]),
-            "dados": {
-                "nome": m["nome"],
-                "crm": m["crm"],
-                "uf_crm": m.get("uf_crm"),
-                "especialidades": m.get("especialidades", []),
-                "status": m["status"],
-            },
-        }
-        for m in db.usuarios.find(
-            {"cargo": "Medico"},
-            {"nome": 1, "crm": 1, "uf_crm": 1, "especialidades": 1, "status": 1}
-        )
-    ]
+def ler_medicos(db, conexao):
+    """Junta o nome e o status do PostgreSQL aos detalhes da coleção medicos."""
+    detalhes = {d["usuario_id"]: d for d in db.medicos.find()}
+    with conexao.cursor(row_factory=dict_row) as cursor:
+        cursor.execute("SELECT id, nome, status FROM usuarios WHERE cargo = 'Medico'")
+        return [
+            {
+                "postgres_id": m["id"],
+                "dados": {
+                    "nome": m["nome"],
+                    "status": m["status"],
+                    "crm": detalhes[m["id"]]["crm"],
+                    "uf_crm": detalhes[m["id"]]["uf_crm"],
+                    "especialidades": detalhes[m["id"]].get("especialidades", []),
+                },
+            }
+            for m in cursor
+        ]
 
 
 def ler_historico_clinico(db):
     atendimentos, diagnosticos, prescricoes = [], [], []
-    for prontuario in db.prontuarios.find({}):
+    for prontuario in db.prontuarios.find():
         paciente_id = str(prontuario["paciente_id"])
 
         for consulta in prontuario.get("consultas", []):
-            consulta_id = texto_id(consulta.get("_id"))
-            medico_id = texto_id(consulta.get("medico_id"))
-            if medico_id:
-                atendimentos.append(
-                    {
-                        "paciente_id": paciente_id,
-                        "medico_id": medico_id,
-                        "consulta_id": consulta_id,
-                        "queixa_principal": consulta.get("queixa_principal"),
-                        "sintomas": consulta.get("sintomas", []),
-                    }
-                )
+            consulta_id = str(consulta["_id"])
+            medico_id = consulta["medico_id"]
+            atendimentos.append(
+                {
+                    "paciente_id": paciente_id,
+                    "medico_id": medico_id,
+                    "consulta_id": consulta_id,
+                    "queixa_principal": consulta.get("queixa_principal"),
+                    "sintomas": consulta.get("sintomas", []),
+                }
+            )
             for diagnostico in consulta.get("diagnosticos", []):
                 nome, cid = separar_cid(diagnostico)
                 diagnosticos.append(
@@ -611,32 +598,31 @@ def ler_historico_clinico(db):
                 )
 
         for prescricao in prontuario.get("prescricoes", []):
-            if prescricao.get("nome"):
-                prescricoes.append(
-                    {
-                        "paciente_id": paciente_id,
-                        "nome": prescricao["nome"].strip(),
-                        "dosagem": prescricao.get("dosagem"),
-                        "frequencia": prescricao.get("frequencia"),
-                        "orientacoes": prescricao.get("orientacoes"),
-                    }
-                )
+            prescricoes.append(
+                {
+                    "paciente_id": paciente_id,
+                    "nome": prescricao["nome"].strip(),
+                    "dosagem": prescricao.get("dosagem"),
+                    "frequencia": prescricao.get("frequencia"),
+                    "orientacoes": prescricao.get("orientacoes"),
+                }
+            )
     return atendimentos, diagnosticos, prescricoes
 
 
-def sincronizar_neo4j(db, driver, banco):
-    """Espelha no Neo4j os pacientes, médicos e prontuários do MongoDB."""
+def montar_grafo(db, conexao, driver, banco):
+    """Apaga o grafo e o recria a partir do PostgreSQL e do MongoDB."""
+    driver.execute_query(CYPHER_LIMPAR_GRAFO, database_=banco)
     for restricao in RESTRICOES_NEO4J:
         driver.execute_query(restricao, database_=banco)
 
     pacientes = ler_pacientes(db)
-    medicos = ler_medicos(db)
+    medicos = ler_medicos(db, conexao)
     atendimentos, diagnosticos, prescricoes = ler_historico_clinico(db)
 
     def gravar(tx):
         tx.run(CYPHER_PACIENTES, linhas=pacientes)
         tx.run(CYPHER_MEDICOS, linhas=medicos)
-        tx.run(CYPHER_LIMPAR_HISTORICO, pacientes=[p["mongo_id"] for p in pacientes])
         tx.run(CYPHER_ATENDIMENTOS, linhas=atendimentos)
         tx.run(CYPHER_DIAGNOSTICOS, linhas=diagnosticos)
         tx.run(CYPHER_PRESCRICOES, linhas=prescricoes)
@@ -646,13 +632,23 @@ def sincronizar_neo4j(db, driver, banco):
 
 
 # --------------------------------------------------------------------------
-# Execução
+# Conexões
 # --------------------------------------------------------------------------
 
 
 def carregar_secrets():
     # utf-8-sig: o secrets.toml pode ter sido salvo com BOM.
     return tomllib.loads(ARQUIVO_SECRETS.read_text(encoding="utf-8-sig"))
+
+
+def conectar_postgres(config):
+    try:
+        return psycopg.connect(config["uri"], connect_timeout=5)
+    except psycopg.OperationalError:
+        raise SystemExit(
+            "Não foi possível conectar ao PostgreSQL. "
+            "Suba o container com: docker compose up -d postgres"
+        )
 
 
 def conectar_mongodb(config):
@@ -698,58 +694,49 @@ def conectar_redis(config):
     return cliente
 
 
-def preparar_colecao(db, nome):
-    if nome in db.list_collection_names():
-        db.command("collMod", nome, validator=VALIDADORES[nome])
-    else:
-        db.create_collection(nome, validator=VALIDADORES[nome])
-    db[nome].create_indexes(INDICES[nome])
+# --------------------------------------------------------------------------
+# Execução
+# --------------------------------------------------------------------------
 
 
-def salvar(colecao, filtro, documento):
-    """Insere ou substitui o documento que casa com o filtro e devolve o _id."""
-    salvo = colecao.find_one_and_replace(
-        filtro,
-        documento,
-        upsert=True,
-        projection={"_id": True},
-        return_document=ReturnDocument.AFTER,
-    )
-    return salvo["_id"]
+def criar_tabela_usuarios(conexao):
+    conexao.execute("DROP TABLE IF EXISTS usuarios")
+    conexao.execute(SQL_TABELA_USUARIOS)
 
 
-def semear(db):
-    pacientes = {
-        chave: salvar(db.pacientes, {"cpf": doc["cpf"]}, doc)
-        for chave, doc in PACIENTES.items()
-    }
+def criar_colecoes(db):
+    for nome, validador in VALIDADORES.items():
+        db.create_collection(nome, validator=validador)
+        db[nome].create_indexes(INDICES[nome])
+
+
+def semear(conexao, db):
     medicos = {
-        chave: salvar(
-            db.usuarios, {"crm": doc["crm"], "uf_crm": doc["uf_crm"]}, doc
-        )
-        for chave, doc in MEDICOS.items()
+        chave: conexao.execute(SQL_INSERIR_USUARIO, medico["usuario"]).fetchone()[0]
+        for chave, medico in MEDICOS.items()
     }
-    for doc in RECEPCIONISTAS.values():
-        salvar(db.usuarios, {"cpf": doc["cpf"]}, doc)
+    for recepcionista in RECEPCIONISTAS:
+        conexao.execute(SQL_INSERIR_USUARIO, recepcionista)
+    # Os ids só vão para o MongoDB depois de gravados no PostgreSQL.
+    conexao.commit()
+
+    db.medicos.insert_many(
+        [
+            {"usuario_id": medicos[chave], **medico["detalhes"]}
+            for chave, medico in MEDICOS.items()
+        ]
+    )
+    pacientes = {
+        chave: db.pacientes.insert_one(paciente).inserted_id
+        for chave, paciente in PACIENTES.items()
+    }
     consultas = {chave: ObjectId() for chave in ("ana", "carlos_1", "carlos_2")}
-    for prontuario in montar_prontuarios(pacientes, medicos, consultas):
-        salvar(db.prontuarios, {"paciente_id": prontuario["paciente_id"]}, prontuario)
-    for agendamento in montar_agendamentos(pacientes, medicos, consultas):
-        filtro = {
-            campo: agendamento[campo]
-            for campo in ("paciente_id", "medico_id", "horario_inicio")
-        }
-        salvar(db.agendamentos, filtro, agendamento)
+    db.prontuarios.insert_many(montar_prontuarios(pacientes, medicos, consultas))
+    db.agendamentos.insert_many(montar_agendamentos(pacientes, medicos, consultas))
 
 
-def recarregar_cache_agendas(db, redis_client):
-    """Descarta o cache das agendas e o recarrega com as agendas futuras.
-
-    O cache é descartado porque os ids das consultas mudam a cada execução.
-    """
-    for chave in redis_client.scan_iter(match=f"{PREFIXO_AGENDA}*"):
-        redis_client.delete(chave)
-
+def carregar_cache_agendas(db, redis_client):
+    """Guarda no Redis as agendas dos dias que ainda têm consultas."""
     cache = AgendaCacheService(redis_client, MongoRepository(db))
     agendamentos = db.agendamentos.find(
         {
@@ -762,11 +749,15 @@ def recarregar_cache_agendas(db, redis_client):
         (item["medico_id"], item["horario_inicio"].astimezone(FUSO_BRASILIA).date())
         for item in agendamentos
     }
-    for medico_id, dia_agenda in sorted(agendas, key=lambda item: (str(item[0]), item[1])):
+    for medico_id, dia_agenda in sorted(agendas):
         cache.obter_agenda_dia(medico_id, dia_agenda)
 
 
-def imprimir_resumo(db, driver, banco_neo4j, redis_client):
+def imprimir_resumo(conexao, db, driver, banco_neo4j, redis_client):
+    usuarios = conexao.execute("SELECT count(*) FROM usuarios").fetchone()[0]
+    print(f"PostgreSQL ({conexao.info.dbname}):")
+    print(f"  usuarios: {usuarios} registro(s)")
+
     print(f"MongoDB ({db.name}):")
     for nome in VALIDADORES:
         print(f"  {nome}: {db[nome].count_documents({})} documento(s)")
@@ -789,38 +780,30 @@ def imprimir_resumo(db, driver, banco_neo4j, redis_client):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Popula o MongoDB com dados de exemplo e sincroniza o grafo no Neo4j."
-    )
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="apaga as coleções e o grafo antes de recriá-los",
-    )
-    args = parser.parse_args()
-
     secrets = carregar_secrets()
+    banco_mongo = secrets["mongodb"]["database"]
     banco_neo4j = secrets["neo4j"].get("database", "neo4j")
 
-    # Conecta nos três bancos antes de gravar qualquer coisa.
+    # Conecta nos quatro bancos antes de apagar qualquer coisa.
     with (
+        conectar_postgres(secrets["postgres"]) as conexao,
         conectar_mongodb(secrets["mongodb"]) as cliente,
         conectar_neo4j(secrets["neo4j"]) as driver,
         conectar_redis(secrets["redis"]) as redis_client,
     ):
-        db = cliente[secrets["mongodb"]["database"]]
-        if args.reset:
-            for nome in VALIDADORES:
-                db.drop_collection(nome)
-            driver.execute_query(CYPHER_LIMPAR_GRAFO, database_=banco_neo4j)
+        criar_tabela_usuarios(conexao)
 
-        for nome in VALIDADORES:
-            preparar_colecao(db, nome)
-        semear(db)
-        sincronizar_neo4j(db, driver, banco_neo4j)
-        recarregar_cache_agendas(db, redis_client)
+        cliente.drop_database(banco_mongo)
+        db = cliente[banco_mongo]
+        criar_colecoes(db)
 
-        imprimir_resumo(db, driver, banco_neo4j, redis_client)
+        semear(conexao, db)
+        montar_grafo(db, conexao, driver, banco_neo4j)
+
+        redis_client.flushdb()
+        carregar_cache_agendas(db, redis_client)
+
+        imprimir_resumo(conexao, db, driver, banco_neo4j, redis_client)
 
 
 if __name__ == "__main__":

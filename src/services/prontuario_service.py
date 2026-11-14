@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 
 from repositories.mongo_repository import MongoRepository
+from services.usuario_service import UsuarioService
 
 COLECAO_PRONTUARIOS = "prontuarios"
 STATUS_AGENDADO = "Agendado"
@@ -15,8 +16,11 @@ def _filtro_da_consulta(consulta_id):
 
 
 class ProntuarioService:
-    def __init__(self, mongo_repository: MongoRepository):
+    def __init__(
+        self, mongo_repository: MongoRepository, usuario_service: UsuarioService
+    ):
         self.mongo_repository = mongo_repository
+        self.usuario_service = usuario_service
 
     def atualizar_anexo(self, paciente_id, consulta_id, arquivo):
         anexo = {
@@ -108,7 +112,7 @@ class ProntuarioService:
         return resultado.matched_count > 0
 
     def _obter_consultas_por_status(self, status):
-        return self.mongo_repository.aggregate(
+        consultas = self.mongo_repository.aggregate(
             COLECAO_PRONTUARIOS,
             [
                 {"$unwind": "$consultas"},
@@ -122,30 +126,31 @@ class ProntuarioService:
                     }
                 },
                 {
-                    "$lookup": {
-                        "from": "usuarios",
-                        "localField": "consultas.medico_id",
-                        "foreignField": "_id",
-                        "as": "medico",
-                    }
-                },
-                {
                     "$project": {
                         "_id": 0,
                         "paciente_id": 1,
                         "consulta_id": "$consultas._id",
+                        "medico_id": "$consultas.medico_id",
                         "queixa_principal": "$consultas.queixa_principal",
                         "sintomas": "$consultas.sintomas",
                         "diagnosticos": "$consultas.diagnosticos",
                         "observacoes": "$consultas.observacoes",
                         "paciente_nome": {"$first": "$paciente.nome"},
                         "paciente_cpf": {"$first": "$paciente.cpf"},
-                        "medico_nome": {"$first": "$medico.nome"},
                     }
                 },
                 {"$sort": {"paciente_nome": 1}},
             ],
         )
+        # Os médicos ficam no PostgreSQL, então o nome é buscado à parte.
+        nomes = self.usuario_service.obter_nomes(
+            consulta.get("medico_id") for consulta in consultas
+        )
+        for consulta in consultas:
+            nome = nomes.get(consulta.get("medico_id"))
+            if nome is not None:
+                consulta["medico_nome"] = nome
+        return consultas
 
     def finalizar_consulta(self, paciente_id, consulta_id, arquivo, receita):
         laudo = {

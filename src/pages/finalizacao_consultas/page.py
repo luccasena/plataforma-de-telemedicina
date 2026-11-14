@@ -1,14 +1,22 @@
 import streamlit as st
+from psycopg import Error as PostgresError
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
-from config.database import conectar_redis, obter_mongo_repository
+from config.database import (
+    conectar_redis,
+    obter_mongo_repository,
+    obter_postgres_repository,
+)
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
+from services.usuario_service import UsuarioService
 
 mongo_repository = obter_mongo_repository()
 redis_client = conectar_redis()
-prontuario_service = ProntuarioService(mongo_repository)
+prontuario_service = ProntuarioService(
+    mongo_repository, UsuarioService(obter_postgres_repository(), mongo_repository)
+)
 fila_service = FilaService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
 
@@ -93,7 +101,7 @@ def exibir_finalizacao():
 
     try:
         consultas = prontuario_service.obter_consultas_em_andamento()
-    except PyMongoError:
+    except (PyMongoError, PostgresError):
         st.error("Não foi possível carregar as consultas em andamento.")
         return
 
