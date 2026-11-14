@@ -11,12 +11,11 @@ docker compose up -d
 ## Gerar dados iniciais
 
 Com os containers em execução, gere as coleções, os validadores e os dados de
-exemplo no MongoDB e no Neo4j. Depois, aqueça o cache das agendas futuras no
-Redis:
+exemplo no MongoDB e no Neo4j. O mesmo script também recarrega no Redis o cache
+das agendas futuras:
 
 ```bash
 python src/config/seed.py
-python src/config/seed_agendas.py
 ```
 
 ## Executar localmente (Windows PowerShell)
@@ -40,12 +39,11 @@ Confirme que as credenciais de `.env` correspondem às URLs e credenciais em
 ```powershell
 docker compose up -d
 python src/config/seed.py
-python src/config/seed_agendas.py
 $env:PYTHONPATH = "src"
 streamlit run src/app.py
 ```
 
-Para executar os testes do cache de agendas, em outro terminal com o mesmo
+Para executar os testes, em outro terminal com o mesmo
 ambiente virtual ativado:
 
 ```powershell
@@ -72,13 +70,26 @@ muda a consulta para `Em andamento` e a exibe em **Consultas em atendimento**. A
 válidas e atualiza os dados automaticamente a cada 15 segundos (ou pelo botão
 **Atualizar agora**).
 
-A agenda do médico e do dia selecionados usa cache-aside: consulta primeiro
+Cada documento de `agendamentos` aponta para a consulta do prontuário pelo
+campo `consulta_id` (obrigatório nos agendamentos `confirmado` e
+`em_atendimento`). A **Agenda do dia** lista, para o médico e a data
+selecionados, as consultas referenciadas pelos agendamentos confirmados/em
+atendimento, com o intervalo `horario_inicio` - `horario_fim`, o paciente, a
+queixa principal e o status atual da consulta.
+
+A agenda usa cache-aside: consulta primeiro
 `agenda:medico:<medico_id>:<AAAA-MM-DD>` no Redis e, em caso de ausência,
-consulta os agendamentos confirmados/em atendimento no MongoDB e guarda o
-resultado por 12 horas. `AgendaCacheService.invalidar_agenda_dia(medico_id, data)`
-remove o cache daquele médico e dia; qualquer fluxo que altere um agendamento
-deve chamar esse método após persistir a alteração no MongoDB.
-`seed_agendas.py` preaquece as agendas futuras já existentes no MongoDB.
+monta a agenda no MongoDB e guarda o resultado por 12 horas. Como o cache
+guarda o status da consulta, ele precisa ser descartado sempre que um
+agendamento ou o status de uma consulta mudar:
+
+- `AgendaCacheService.invalidar_agenda_dia(medico_id, data)`: remove o cache
+  daquele médico e dia.
+- `AgendaCacheService.invalidar_agendas_da_consulta(consulta_id)`: remove o
+  cache de todos os dias em que a consulta está agendada. É chamado ao chamar o
+  próximo paciente e ao finalizar a consulta.
+
+O `seed.py` descarta e recarrega o cache das agendas futuras.
 
 ## Finalização de Consultas
 

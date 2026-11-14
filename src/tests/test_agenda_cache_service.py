@@ -28,13 +28,21 @@ class RedisFake:
 
 
 class CollectionFake:
-    def __init__(self, documents):
+    def __init__(self, documents, agendamentos=()):
         self.documents = documents
+        self.agendamentos = list(agendamentos)
         self.aggregate_calls = 0
 
     def aggregate(self, pipeline):
         self.aggregate_calls += 1
         return self.documents
+
+    def find(self, filtro, projecao=None):
+        return [
+            agendamento
+            for agendamento in self.agendamentos
+            if agendamento["consulta_id"] == filtro["consulta_id"]
+        ]
 
 
 class DatabaseFake:
@@ -53,12 +61,18 @@ class AgendaCacheServiceTests(unittest.TestCase):
         self.database = DatabaseFake(
             [
                 {
+                    "agendamento_id": "agendamento-1",
+                    "consulta_id": "consulta-1",
                     "paciente_nome": "Ana Souza",
-                    "medico_nome": "Dr. João",
+                    "queixa_principal": "Dor de cabeça",
                     "horario_inicio": datetime(
                         2026, 11, 17, 12, 0, tzinfo=timezone.utc
                     ),
-                    "status": "confirmado",
+                    "horario_fim": datetime(
+                        2026, 11, 17, 12, 30, tzinfo=timezone.utc
+                    ),
+                    "status_agendamento": "confirmado",
+                    "status_consulta": "Agendado",
                 }
             ]
         )
@@ -84,6 +98,8 @@ class AgendaCacheServiceTests(unittest.TestCase):
             agenda[0]["horario_inicio"],
             "2026-11-17T12:00:00+00:00",
         )
+        self.assertEqual(agenda[0]["horario_fim"], "2026-11-17T12:30:00+00:00")
+        self.assertEqual(agenda[0]["status_consulta"], "Agendado")
 
     def test_cache_hit_skips_mongo(self):
         first_result = self.service.obter_agenda_dia("medico-1", self.data)
@@ -109,6 +125,39 @@ class AgendaCacheServiceTests(unittest.TestCase):
         self.service.obter_agenda_dia("medico-1", self.data)
 
         self.assertEqual(self.database.collection.aggregate_calls, 2)
+
+    def test_invalidar_agendas_da_consulta_removes_each_day_cache(self):
+        # 01:00 UTC de 18/11 ainda é 17/11 no horário de Brasília; o PyMongo
+        # sem tz_aware devolve o horário sem fuso.
+        self.database.collection.agendamentos = [
+            {
+                "consulta_id": "consulta-1",
+                "medico_id": "medico-1",
+                "horario_inicio": datetime(2026, 11, 18, 1, 0),
+            },
+            {
+                "consulta_id": "consulta-1",
+                "medico_id": "medico-1",
+                "horario_inicio": datetime(2026, 11, 20, 12, 0),
+            },
+        ]
+        outra_data = date(2026, 11, 20)
+        self.service.obter_agenda_dia("medico-1", self.data)
+        self.service.obter_agenda_dia("medico-1", outra_data)
+        self.service.obter_agenda_dia("medico-2", self.data)
+
+        self.service.invalidar_agendas_da_consulta("consulta-1")
+
+        self.assertNotIn("agenda:medico:medico-1:2026-11-17", self.redis.values)
+        self.assertNotIn("agenda:medico:medico-1:2026-11-20", self.redis.values)
+        self.assertIn("agenda:medico:medico-2:2026-11-17", self.redis.values)
+
+    def test_invalidar_agendas_da_consulta_without_agendamento(self):
+        self.service.obter_agenda_dia("medico-1", self.data)
+
+        self.service.invalidar_agendas_da_consulta("consulta-sem-agenda")
+
+        self.assertIn("agenda:medico:medico-1:2026-11-17", self.redis.values)
 
 
 if __name__ == "__main__":

@@ -112,6 +112,11 @@ def _chamar_proximo():
         )
         return
 
+    try:
+        agenda_cache_service.invalidar_agendas_da_consulta(consulta_id)
+    except (PyMongoError, RedisError):
+        st.toast("Consulta iniciada, mas não foi possível atualizar a agenda do dia.")
+
     st.toast(f"Paciente chamado: {paciente_nome}. Consulta em andamento.")
     st.rerun()
 
@@ -166,15 +171,19 @@ def _exibir_agenda(medicos):
         return
 
     if not agenda:
-        st.info("Não há agendamentos confirmados para este médico nesta data.")
+        st.info("Não há consultas agendadas para este médico nesta data.")
         return
 
     st.dataframe(
         [
             {
-                "Horário": _formatar_horario(item["horario_inicio"]),
+                "Horário": (
+                    f"{_formatar_horario(item['horario_inicio'])}"
+                    f" - {_formatar_horario(item['horario_fim'])}"
+                ),
                 "Paciente": item.get("paciente_nome") or "Paciente não encontrado",
-                "Status": item["status"],
+                "Queixa principal": item.get("queixa_principal") or "-",
+                "Status da consulta": item.get("status_consulta") or "-",
             }
             for item in agenda
         ],
