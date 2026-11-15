@@ -86,7 +86,8 @@ gerado pelo banco) é a referência usada pelos outros bancos:
 - MongoDB: `usuario_id` na coleção `medicos` e `medico_id` em
   `prontuarios.consultas` e em `agendamentos`;
 - Redis: `usuario_id` da sessão e a chave `agenda:medico:<id>:<AAAA-MM-DD>`;
-- Neo4j: propriedade `postgres_id` dos nós `(:Medico)`.
+- Neo4j: propriedade `postgres_id` dos nós `(:Medico)`, usada pela tela
+  **Mapeamento Clínico** para identificar os médicos.
 
 Os detalhes de cada médico ficam na coleção `medicos` do MongoDB:
 
@@ -118,9 +119,10 @@ Quem já tinha o `.streamlit/secrets.toml` precisa acrescentar a ele a seção
 A tela **Recepção Virtual** apresenta a fila ordenada por chegada, posição e
 tempo de espera. A recepção só pode adicionar à fila consultas com status
 `Agendado` no prontuário; **Chamar próximo paciente** retira o primeiro da fila,
-muda a consulta para `Em andamento` e a exibe em **Consultas em atendimento**. A tela lista também as sessões Redis ainda
-válidas e atualiza os dados automaticamente a cada 15 segundos (ou pelo botão
-**Atualizar agora**).
+muda a consulta para `Em andamento`, cria o token de sessão da consulta e a
+exibe em **Consultas em atendimento**, com o token e o tempo até expirar. A
+tela lista também as sessões Redis ainda válidas e atualiza os dados
+automaticamente a cada 15 segundos (ou pelo botão **Atualizar agora**).
 
 Cada documento de `agendamentos` aponta para a consulta do prontuário pelo
 campo `consulta_id` (obrigatório nos agendamentos `confirmado` e
@@ -129,6 +131,12 @@ selecionados, as consultas referenciadas pelos agendamentos confirmados/em
 atendimento, com o intervalo `horario_inicio` - `horario_fim`, o paciente, a
 queixa principal e o status atual da consulta.
 
+Ao criar uma consulta na tela **Atendimento Médico**, o médico informa a data e
+o horário. O `ProntuarioService.criar_consulta` grava, além da consulta no
+prontuário, um agendamento `confirmado` de 30 minutos apontando para ela, e a
+tela descarta o cache daquele médico e dia. Assim, a consulta aparece na
+**Agenda do dia**.
+
 A agenda usa cache-aside: consulta primeiro
 `agenda:medico:<medico_id>:<AAAA-MM-DD>` no Redis e, em caso de ausência,
 monta a agenda no MongoDB e guarda o resultado por 12 horas. Como o cache
@@ -136,7 +144,7 @@ guarda o status da consulta, ele precisa ser descartado sempre que um
 agendamento ou o status de uma consulta mudar:
 
 - `AgendaCacheService.invalidar_agenda_dia(medico_id, data)`: remove o cache
-  daquele médico e dia.
+  daquele médico e dia. É chamado ao criar uma consulta.
 - `AgendaCacheService.invalidar_agendas_da_consulta(consulta_id)`: remove o
   cache de todos os dias em que a consulta está agendada. É chamado ao chamar o
   próximo paciente e ao finalizar a consulta.
@@ -146,25 +154,101 @@ O `seed.py` zera o Redis e carrega o cache das agendas futuras.
 ## Finalização de Consultas
 
 A tela lista as consultas com status `Em andamento` e permite que o médico
-finalize cada uma anexando o laudo em PDF e, opcionalmente, a receita ou
-orientações. Quando não há consultas, exibe "Sem consultas a serem finalizadas".
+finalize cada uma anexando o laudo em PDF e, opcionalmente, as prescrições (uma
+linha por medicamento, com dosagem, frequência e orientações) e a receita ou
+orientações gerais. Quando não há consultas, exibe "Sem consultas a serem
+finalizadas".
 
 Ao finalizar uma consulta:
 
 1. **MongoDB** (`prontuarios`): o laudo é adicionado em
-   `consultas.exames_laudos` (`$push`), a receita é salva em
-   `consultas.receita` e o status muda para `Concluído`.
-2. **Redis**: a consulta é removida da fila de espera e o status na fila passa
-   para `Concluído`.
+   `consultas.exames_laudos` (`$push`), as prescrições são acrescentadas em
+   `prescricoes` com o `consulta_id`, a receita é salva em `consultas.receita`
+   e o status muda para `Concluído`.
+2. **Neo4j**: cada prescrição vira
+   `(:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)`, que os alertas de
+   segurança passam a verificar.
+3. **Redis**: a consulta é removida da fila de espera, o status na fila passa
+   para `Concluído` e o token de sessão da consulta é revogado.
+
+O histórico da tela **Atendimento Médico** mostra a receita de cada consulta e
+a lista de prescrições do paciente.
 
 Métodos usados (`ProntuarioService`):
 
 - `obter_consultas_em_andamento()`: aggregate com `$unwind`, `$match` e
   `$lookup` para trazer as consultas em andamento com o paciente; o nome do
   médico vem da tabela `usuarios` do PostgreSQL.
-- `finalizar_consulta(paciente_id, consulta_id, arquivo, receita)`: grava o
-  laudo e conclui a consulta. Retorna `False` se a consulta não estiver mais em
-  andamento.
+- `finalizar_consulta(paciente_id, consulta_id, arquivo, receita, prescricoes)`:
+  grava o laudo e as prescrições e conclui a consulta. Retorna `False` se a
+  consulta não estiver mais em andamento.
+
+## Mapeamento Clínico e alertas de segurança (Neo4j)
+
+A tela lê o grafo que o `seed.py` monta a partir do PostgreSQL e do MongoDB:
+
+- `(:Medico)-[:ATENDEU]->(:Paciente)`
+- `(:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)`
+- `(:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)`
+
+O `seed.py` grava também um catálogo clínico (`INTERACOES_MEDICAMENTOSAS` e
+`CONTRAINDICACOES`), que liga os medicamentos pelo nome usado nas prescrições e
+os diagnósticos pelo CID:
+
+- `(:Medicamento)-[:INTERAGE_COM {severidade, descricao}]->(:Medicamento)`
+- `(:Medicamento)-[:CONTRAINDICADO_PARA {severidade, motivo}]->(:Diagnostico)`
+
+Para o paciente selecionado, a tela mostra:
+
+- **Alertas de segurança**: alergia a um medicamento prescrito, interação entre
+  medicamentos prescritos, medicamento contraindicado para um diagnóstico do
+  paciente e prescrição duplicada.
+- **Diagnósticos correlacionados em cadeia**: dois diagnósticos se
+  correlacionam quando algum paciente tem os dois. A partir dos diagnósticos do
+  paciente, a busca segue essas ligações com `shortestPath` por até 3 níveis e
+  mostra o nível e a cadeia, por exemplo
+  `Enxaqueca sem aura → Asma → Rinite alérgica`.
+- **Grafo de relações clínicas** do paciente.
+
+No fim da tela, a **Teia de Diagnósticos da Clínica** mostra o grafo de todos
+os pacientes.
+
+Com os dados de exemplo:
+
+| Paciente | Diagnósticos | Alertas |
+|---|---|---|
+| Ana | Enxaqueca, asma | Propranolol contraindicado para asma; interação entre propranolol e salbutamol |
+| Carlos | Hipertensão, enxaqueca | Interação entre losartana e ibuprofeno |
+| Mariana | Asma, rinite alérgica | Nenhum |
+
+### Atualização do grafo pela aplicação
+
+O `ProntuarioService` grava no MongoDB e, em seguida, atualiza o grafo pelo
+`MapeamentoClinicoService`. Ao criar uma consulta (`registrar_consulta`):
+
+1. cria ou atualiza os nós `(:Paciente)` (dados da coleção `pacientes`) e
+   `(:Medico)` (id e nome da tabela `usuarios`);
+2. cria `(:Medico)-[:ATENDEU {consulta_id, queixa_principal, sintomas}]->(:Paciente)`;
+3. para cada diagnóstico, cria o nó `(:Diagnostico)` se ainda não existir e
+   `(:Paciente)-[:DIAGNOSTICADO_COM {consulta_id, medico_id}]->(:Diagnostico)`.
+
+O diagnóstico é identificado pelo CID escrito no fim do texto, como em
+`Asma (CID J45.9)`; sem CID, o próprio nome vira o código. A mesma regra
+(`separar_cid`) é usada pelo `seed.py`. Os métodos de escrita do
+`Neo4jRepository` usam `MERGE`, então os nós que já existem são reaproveitados.
+
+Ao editar os diagnósticos de uma consulta no Atendimento
+(`atualizar_diagnosticos`), os relacionamentos `DIAGNOSTICADO_COM` daquela
+consulta são removidos e criados de novo com a lista editada.
+
+Ao finalizar uma consulta com prescrições (`registrar_prescricoes`), cada
+medicamento vira `(:Paciente)-[:RECEBEU_PRESCRICAO {consulta_id, dosagem,
+frequencia, orientacoes}]->(:Medicamento)`. O nome é padronizado com a primeira
+letra maiúscula (`ibuprofeno` → `Ibuprofeno`), como no catálogo clínico, para
+que as interações e contraindicações sejam encontradas.
+
+Se o Neo4j falhar, os dados continuam gravados no MongoDB e a tela avisa que
+não foi possível atualizar o Mapeamento Clínico.
 
 ## Fila de espera no Redis
 
@@ -199,3 +283,14 @@ chave do Redis.
 Essa implementação está no `SessaoService`
 (`src/services/sessao_service.py`), enquanto o token permanece apenas no
 `st.session_state` da sessão ativa do Streamlit.
+
+### Sessões das consultas ativas
+
+Quando a recepção chama o próximo paciente e a consulta passa para
+`Em andamento`, o `SessaoService.criar_sessao_consulta` cria um token aleatório
+para a sala da teleconsulta e o guarda em `sessao_consulta:<consulta_id>`, com
+expiração de 2 horas. A chave fica fora do prefixo `sessao:`, que lista apenas
+as sessões de usuários. Diferente da sessão de usuário, o token fica guardado
+no Redis para que a recepção possa repassá-lo ao paciente; ele aparece em
+**Consultas em atendimento** e é revogado
+(`SessaoService.revogar_sessao_consulta`) ao finalizar a consulta.
