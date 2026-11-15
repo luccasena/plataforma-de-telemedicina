@@ -79,6 +79,24 @@ class Neo4jRepository:
             logger.error("Erro ao executar consulta Cypher: %s | Query: %s", exc, cypher)
             raise
 
+    def _executar_escrita(self, cypher: str, parametros: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Executa um comando Cypher parametrizado em transação de escrita.
+
+        :param cypher: String contendo o comando Cypher.
+        :param parametros: Dicionário de parâmetros Cypher.
+        """
+        if not self.driver:
+            raise ServiceUnavailable("Driver do Neo4j não está disponível.")
+
+        parametros = parametros or {}
+        try:
+            with self.driver.session(database=self.database_name) as session:
+                session.execute_write(lambda tx: tx.run(cypher, parametros).consume())
+        except (Neo4jError, ServiceUnavailable) as exc:
+            logger.error("Erro ao executar escrita Cypher: %s | Query: %s", exc, cypher)
+            raise
+
     # -------------------------------------------------------------------------
     # 1. Consultas de Pacientes
     # -------------------------------------------------------------------------
@@ -118,9 +136,106 @@ class Neo4jRepository:
         resultados = self._executar_leitura(cypher, {"paciente_id": str(paciente_id)})
         return resultados[0] if resultados else None
 
+    def criar_paciente(self, paciente_id: str, dados: Dict[str, Any]) -> None:
+        """
+        Cria o nó (:Paciente) identificado pelo mongo_id ou atualiza os dados dele.
+        """
+        cypher = """
+        MERGE (p:Paciente {mongo_id: $paciente_id})
+        SET p += $dados
+        """
+        self._executar_escrita(cypher, {"paciente_id": str(paciente_id), "dados": dados})
+
     # -------------------------------------------------------------------------
     # 2. Diagnósticos e Médicos
     # -------------------------------------------------------------------------
+
+    def criar_medico(self, medico_id: int, dados: Dict[str, Any]) -> None:
+        """
+        Cria o nó (:Medico) identificado pelo postgres_id (id na tabela usuarios)
+        ou atualiza os dados dele.
+        """
+        cypher = """
+        MERGE (m:Medico {postgres_id: $medico_id})
+        SET m += $dados
+        """
+        self._executar_escrita(cypher, {"medico_id": medico_id, "dados": dados})
+
+    def criar_atendimento(
+        self,
+        medico_id: int,
+        paciente_id: str,
+        consulta_id: str,
+        queixa_principal: Optional[str],
+        sintomas: List[str],
+    ) -> None:
+        """
+        Cria o relacionamento (:Medico)-[:ATENDEU]->(:Paciente) da consulta.
+        Os nós do médico e do paciente precisam existir.
+        """
+        cypher = """
+        MATCH (m:Medico {postgres_id: $medico_id})
+        MATCH (p:Paciente {mongo_id: $paciente_id})
+        MERGE (m)-[r:ATENDEU {consulta_id: $consulta_id}]->(p)
+        SET r.queixa_principal = $queixa_principal,
+            r.sintomas = $sintomas
+        """
+        self._executar_escrita(
+            cypher,
+            {
+                "medico_id": medico_id,
+                "paciente_id": str(paciente_id),
+                "consulta_id": str(consulta_id),
+                "queixa_principal": queixa_principal,
+                "sintomas": sintomas,
+            },
+        )
+
+    def criar_diagnostico(
+        self,
+        paciente_id: str,
+        consulta_id: str,
+        medico_id: int,
+        codigo: str,
+        nome: str,
+        cid: Optional[str],
+    ) -> None:
+        """
+        Cria o nó (:Diagnostico), se ainda não existir, e o relacionamento
+        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico) da consulta.
+        O diagnóstico é identificado pelo código (o CID ou, sem CID, o nome).
+        """
+        cypher = """
+        MATCH (p:Paciente {mongo_id: $paciente_id})
+        MERGE (d:Diagnostico {codigo: $codigo})
+        ON CREATE SET d.nome = $nome, d.cid = $cid
+        MERGE (p)-[r:DIAGNOSTICADO_COM {consulta_id: $consulta_id}]->(d)
+        SET r.medico_id = $medico_id
+        """
+        self._executar_escrita(
+            cypher,
+            {
+                "paciente_id": str(paciente_id),
+                "consulta_id": str(consulta_id),
+                "medico_id": medico_id,
+                "codigo": codigo,
+                "nome": nome,
+                "cid": cid,
+            },
+        )
+
+    def remover_diagnosticos_consulta(self, paciente_id: str, consulta_id: str) -> None:
+        """
+        Remove os relacionamentos (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)
+        da consulta. Os nós (:Diagnostico) continuam no grafo.
+        """
+        cypher = """
+        MATCH (:Paciente {mongo_id: $paciente_id})-[r:DIAGNOSTICADO_COM {consulta_id: $consulta_id}]->(:Diagnostico)
+        DELETE r
+        """
+        self._executar_escrita(
+            cypher, {"paciente_id": str(paciente_id), "consulta_id": str(consulta_id)}
+        )
 
     def buscar_diagnosticos_paciente(self, paciente_id: str) -> List[Dict[str, Any]]:
         """
@@ -173,6 +288,40 @@ class Neo4jRepository:
         ORDER BY m.nome ASC
         """
         return self._executar_leitura(cypher, {"paciente_id": str(paciente_id)})
+
+    def criar_prescricao(
+        self,
+        paciente_id: str,
+        consulta_id: str,
+        nome: str,
+        dosagem: Optional[str],
+        frequencia: Optional[str],
+        orientacoes: Optional[str],
+    ) -> None:
+        """
+        Cria o nó (:Medicamento), se ainda não existir, e o relacionamento
+        (:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento) da consulta.
+        O medicamento é identificado pelo nome, como no catálogo clínico.
+        """
+        cypher = """
+        MATCH (p:Paciente {mongo_id: $paciente_id})
+        MERGE (m:Medicamento {nome: $nome})
+        MERGE (p)-[r:RECEBEU_PRESCRICAO {consulta_id: $consulta_id}]->(m)
+        SET r.dosagem = $dosagem,
+            r.frequencia = $frequencia,
+            r.orientacoes = $orientacoes
+        """
+        self._executar_escrita(
+            cypher,
+            {
+                "paciente_id": str(paciente_id),
+                "consulta_id": str(consulta_id),
+                "nome": nome,
+                "dosagem": dosagem,
+                "frequencia": frequencia,
+                "orientacoes": orientacoes,
+            },
+        )
 
     # -------------------------------------------------------------------------
     # 4. Alertas de Segurança e Incompatibilidades

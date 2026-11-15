@@ -4,12 +4,13 @@ import streamlit.components.v1 as components
 
 from pyvis.network import Network
 
+from config.database import obter_neo4j_repository
 from services.mapeamento_clinico_service import MapeamentoClinicoService
 
 
 @st.cache_resource
 def obter_servico():
-    return MapeamentoClinicoService()
+    return MapeamentoClinicoService(obter_neo4j_repository())
 
 
 def incluir_alergias_no_grafo(dados_grafo):

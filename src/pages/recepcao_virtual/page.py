@@ -10,6 +10,7 @@ from redis.exceptions import RedisError
 from config.database import (
     conectar_redis,
     obter_mongo_repository,
+    obter_neo4j_repository,
     obter_postgres_repository,
 )
 from services.agenda_cache_service import AgendaCacheService
@@ -26,7 +27,9 @@ fila_service = FilaService(redis_client)
 sessao_service = SessaoService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
 usuario_service = UsuarioService(obter_postgres_repository(), mongo_repository)
-prontuario_service = ProntuarioService(mongo_repository, usuario_service)
+prontuario_service = ProntuarioService(
+    mongo_repository, usuario_service, obter_neo4j_repository()
+)
 
 
 def _formatar_horario(valor):

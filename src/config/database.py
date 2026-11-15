@@ -4,6 +4,7 @@ from neo4j import GraphDatabase
 from psycopg_pool import ConnectionPool
 from pymongo import MongoClient
 from repositories.mongo_repository import MongoRepository
+from repositories.neo4j_repository import Neo4jRepository
 from repositories.postgres_repository import PostgresRepository
 
 @st.cache_resource
@@ -53,4 +54,10 @@ def conectar_neo4j():
             configuracao["username"],
             configuracao["password"],
         ),
+    )
+
+def obter_neo4j_repository():
+    return Neo4jRepository(
+        conectar_neo4j(),
+        st.secrets["neo4j"].get("database", "neo4j"),
     )

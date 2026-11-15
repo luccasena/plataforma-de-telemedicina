@@ -18,13 +18,17 @@ Apaga os dados existentes e recria tudo com os dados de exemplo:
        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)
        (:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)
 
+   e com o catálogo clínico usado nos alertas de segurança:
+
+       (:Medicamento)-[:INTERAGE_COM]->(:Medicamento)
+       (:Medicamento)-[:CONTRAINDICADO_PARA]->(:Diagnostico)
+
 4. Redis: apaga fila, sessões e cache e carrega o cache das agendas futuras.
 
 Uso, na raiz do projeto, com os containers no ar:
     python src/config/seed.py
 """
 
-import re
 import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -47,6 +51,7 @@ from services.agenda_cache_service import (  # noqa: E402
     STATUS_AGENDA_CACHE,
     AgendaCacheService,
 )
+from services.mapeamento_clinico_service import separar_cid  # noqa: E402
 
 ARQUIVO_SECRETS = Path(__file__).resolve().parents[2] / ".streamlit" / "secrets.toml"
 
@@ -149,6 +154,8 @@ VALIDADORES = {
                     "diagnosticos": LISTA_DE_TEXTO,
                     "observacoes": TEXTO,
                     "status": {"enum": STATUS_CONSULTA},
+                    "receita": TEXTO,
+                    "data_finalizacao": DATA,
                     "exames_laudos": lista_de(
                         {
                             "nome_arquivo": TEXTO,
@@ -168,7 +175,10 @@ VALIDADORES = {
                     "dosagem": TEXTO,
                     "frequencia": TEXTO,
                     "orientacoes": TEXTO,
-                }
+                    # Consulta em que o medicamento foi prescrito (Finalização).
+                    "consulta_id": ID,
+                },
+                obrigatorios=["nome"],
             ),
             "data_atualizacao": DATA,
         },
@@ -328,6 +338,14 @@ def laudo_texto(conteudo):
     return Binary(conteudo.encode("utf-8"))
 
 
+SALBUTAMOL = {
+    "nome": "Salbutamol",
+    "dosagem": "100 mcg/jato",
+    "frequencia": "2 jatos se falta de ar, até 4 vezes ao dia",
+    "orientacoes": "Usar com espaçador.",
+}
+
+
 def montar_prontuarios(pacientes, medicos, consultas):
     agora = datetime.now(timezone.utc)
 
@@ -340,8 +358,14 @@ def montar_prontuarios(pacientes, medicos, consultas):
                     "medico_id": medicos["joao"],
                     "queixa_principal": "Dor de cabeça recorrente há duas semanas",
                     "sintomas": ["Cefaleia pulsátil", "Fotofobia", "Náusea"],
-                    "diagnosticos": ["Enxaqueca sem aura (CID G43.0)"],
-                    "observacoes": "Paciente alérgica a dipirona. Solicitado hemograma.",
+                    "diagnosticos": [
+                        "Enxaqueca sem aura (CID G43.0)",
+                        "Asma (CID J45.9)",
+                    ],
+                    "observacoes": (
+                        "Paciente alérgica a dipirona, com asma em uso de "
+                        "salbutamol. Solicitado hemograma."
+                    ),
                     "status": "Agendado",
                     "exames_laudos": [
                         {
@@ -365,13 +389,46 @@ def montar_prontuarios(pacientes, medicos, consultas):
                     "dosagem": "750 mg",
                     "frequencia": "De 8 em 8 horas, se dor",
                     "orientacoes": "Não exceder 4 comprimidos por dia.",
-                }
+                },
+                {
+                    "nome": "Propranolol",
+                    "dosagem": "40 mg",
+                    "frequencia": "2 vezes ao dia",
+                    "orientacoes": "Profilaxia da enxaqueca.",
+                },
+                SALBUTAMOL,
             ],
             "data_atualizacao": agora,
         },
         {
             "paciente_id": pacientes["carlos"],
             "consultas": [
+                {
+                    "_id": consultas["carlos_enxaqueca"],
+                    "medico_id": medicos["joao"],
+                    "queixa_principal": "Crises de dor de cabeça latejante",
+                    "sintomas": ["Cefaleia pulsátil", "Náusea"],
+                    "diagnosticos": ["Enxaqueca sem aura (CID G43.0)"],
+                    "observacoes": "Crises cerca de duas vezes por mês.",
+                    "status": "Concluído",
+                    "receita": (
+                        "Ibuprofeno 400 mg, de 8 em 8 horas nas crises de "
+                        "enxaqueca, no máximo 3 dias seguidos."
+                    ),
+                    "data_finalizacao": horario(2026, 10, 27, 11, 30),
+                    "exames_laudos": [
+                        {
+                            "nome_arquivo": "avaliacao_neurologica_carlos.txt",
+                            "tipo_arquivo": "text/plain",
+                            "arquivo": laudo_texto(
+                                "AVALIAÇÃO NEUROLÓGICA\n"
+                                "Exame neurológico sem alterações.\n"
+                                "Conclusão: enxaqueca sem aura.\n"
+                            ),
+                            "descricao": "Laudo de finalização da consulta",
+                        }
+                    ],
+                },
                 {
                     "_id": consultas["carlos_1"],
                     "medico_id": medicos["fernanda"],
@@ -411,7 +468,58 @@ def montar_prontuarios(pacientes, medicos, consultas):
                     "dosagem": "50 mg",
                     "frequencia": "1 vez ao dia, pela manhã",
                     "orientacoes": "Uso contínuo. Reduzir o consumo de sal.",
+                },
+                {
+                    "nome": "Ibuprofeno",
+                    "dosagem": "400 mg",
+                    "frequencia": "De 8 em 8 horas, nas crises de enxaqueca",
+                    "orientacoes": "No máximo 3 dias seguidos.",
+                },
+            ],
+            "data_atualizacao": agora,
+        },
+        {
+            "paciente_id": pacientes["mariana"],
+            "consultas": [
+                {
+                    "_id": consultas["mariana"],
+                    "medico_id": medicos["joao"],
+                    "queixa_principal": "Falta de ar e espirros frequentes",
+                    "sintomas": ["Sibilância", "Tosse seca", "Coriza", "Espirros"],
+                    "diagnosticos": [
+                        "Asma (CID J45.9)",
+                        "Rinite alérgica (CID J30.4)",
+                    ],
+                    "observacoes": "Paciente alérgica a penicilina.",
+                    "status": "Concluído",
+                    "receita": (
+                        "Salbutamol 100 mcg/jato, 2 jatos se falta de ar. "
+                        "Loratadina 10 mg, 1 vez ao dia por 30 dias."
+                    ),
+                    "data_finalizacao": horario(2025, 11, 25, 10, 30),
+                    "exames_laudos": [
+                        {
+                            "nome_arquivo": "espirometria_mariana.txt",
+                            "tipo_arquivo": "text/plain",
+                            "arquivo": laudo_texto(
+                                "ESPIROMETRIA\n"
+                                "VEF1/CVF: 0,68 (reduzido)\n"
+                                "Resposta significativa ao broncodilatador.\n"
+                                "Conclusão: distúrbio obstrutivo leve e reversível.\n"
+                            ),
+                            "descricao": "Espirometria com obstrução reversível",
+                        }
+                    ],
                 }
+            ],
+            "prescricoes": [
+                SALBUTAMOL,
+                {
+                    "nome": "Loratadina",
+                    "dosagem": "10 mg",
+                    "frequencia": "1 vez ao dia",
+                    "orientacoes": "Por 30 dias.",
+                },
             ],
             "data_atualizacao": agora,
         },
@@ -437,6 +545,11 @@ def montar_agendamentos(pacientes, medicos, consultas):
         agendamento("carlos", "fernanda", horario(2026, 10, 22, 14), "concluido"),
         agendamento("carlos", "fernanda", horario(2026, 11, 5, 14), "concluido"),
         agendamento("mariana", "joao", horario(2026, 11, 3, 10), "nao_compareceu"),
+        # Consultas do prontuário já concluídas.
+        agendamento("mariana", "joao", horario(2025, 11, 25, 10), "concluido", "mariana"),
+        agendamento(
+            "carlos", "joao", horario(2026, 10, 27, 11), "concluido", "carlos_enxaqueca"
+        ),
         # A consulta da Ana foi remarcada de 10/11 para 17/11.
         agendamento("ana", "joao", horario(2026, 11, 10, 9), "cancelado", "ana"),
         agendamento("ana", "joao", horario(2026, 11, 17, 9), "confirmado", "ana"),
@@ -454,7 +567,61 @@ def montar_agendamentos(pacientes, medicos, consultas):
 # --------------------------------------------------------------------------
 
 ROTULOS = ["Paciente", "Medico", "Diagnostico", "Medicamento"]
-RELACIONAMENTOS = ["ATENDEU", "DIAGNOSTICADO_COM", "RECEBEU_PRESCRICAO"]
+RELACIONAMENTOS = [
+    "ATENDEU",
+    "DIAGNOSTICADO_COM",
+    "RECEBEU_PRESCRICAO",
+    "INTERAGE_COM",
+    "CONTRAINDICADO_PARA",
+]
+
+# Catálogo clínico usado pelos alertas de segurança do Mapeamento Clínico. Os
+# medicamentos têm os mesmos nomes das prescrições e os diagnósticos são
+# identificados pelo CID, que é o código dos nós (:Diagnostico).
+INTERACOES_MEDICAMENTOSAS = [
+    {
+        "medicamento_1": "Losartana potássica",
+        "medicamento_2": "Ibuprofeno",
+        "severidade": "media",
+        "descricao": (
+            "Anti-inflamatórios como o ibuprofeno reduzem o efeito "
+            "anti-hipertensivo da losartana e aumentam o risco de lesão renal "
+            "e de aumento do potássio no sangue."
+        ),
+    },
+    {
+        "medicamento_1": "Propranolol",
+        "medicamento_2": "Salbutamol",
+        "severidade": "media",
+        "descricao": (
+            "O propranolol, betabloqueador não seletivo, bloqueia o efeito "
+            "broncodilatador do salbutamol."
+        ),
+    },
+]
+
+CONTRAINDICACOES = [
+    {
+        "medicamento": "Propranolol",
+        "diagnostico": "Asma",
+        "cid": "J45.9",
+        "severidade": "alta",
+        "motivo": (
+            "Betabloqueador não seletivo: pode desencadear broncoespasmo em "
+            "pacientes com asma."
+        ),
+    },
+    {
+        "medicamento": "Sumatriptana",
+        "diagnostico": "Hipertensão arterial sistêmica",
+        "cid": "I10",
+        "severidade": "alta",
+        "motivo": (
+            "Triptanos causam vasoconstrição e são contraindicados na "
+            "hipertensão não controlada."
+        ),
+    },
+]
 
 RESTRICOES_NEO4J = [
     "CREATE CONSTRAINT paciente_mongo_id IF NOT EXISTS "
@@ -514,19 +681,26 @@ CREATE (p)-[:RECEBEU_PRESCRICAO {
 }]->(m)
 """
 
-CID_NO_FINAL = re.compile(
-    r"\(\s*CID[\s:-]*(?P<cid>[A-Z]\d{2}(?:\.\d{1,2})?)\s*\)$", re.IGNORECASE
-)
+CYPHER_INTERACOES = """
+UNWIND $linhas AS linha
+MERGE (m1:Medicamento {nome: linha.medicamento_1})
+MERGE (m2:Medicamento {nome: linha.medicamento_2})
+CREATE (m1)-[:INTERAGE_COM {
+    severidade: linha.severidade,
+    descricao: linha.descricao
+}]->(m2)
+"""
 
-
-def separar_cid(diagnostico):
-    """'Enxaqueca sem aura (CID G43.0)' -> ('Enxaqueca sem aura', 'G43.0')."""
-    texto = diagnostico.strip()
-    encontrado = CID_NO_FINAL.search(texto)
-    if encontrado:
-        return texto[: encontrado.start()].strip(), encontrado["cid"].upper()
-    return texto, None
-
+CYPHER_CONTRAINDICACOES = """
+UNWIND $linhas AS linha
+MERGE (m:Medicamento {nome: linha.medicamento})
+MERGE (d:Diagnostico {codigo: linha.cid})
+ON CREATE SET d.nome = linha.diagnostico, d.cid = linha.cid
+CREATE (m)-[:CONTRAINDICADO_PARA {
+    severidade: linha.severidade,
+    motivo: linha.motivo
+}]->(d)
+"""
 
 def ler_pacientes(db):
     linhas = []
@@ -611,7 +785,7 @@ def ler_historico_clinico(db):
 
 
 def montar_grafo(db, conexao, driver, banco):
-    """Apaga o grafo e o recria a partir do PostgreSQL e do MongoDB."""
+    """Apaga o grafo e o recria a partir do PostgreSQL, do MongoDB e do catálogo clínico."""
     driver.execute_query(CYPHER_LIMPAR_GRAFO, database_=banco)
     for restricao in RESTRICOES_NEO4J:
         driver.execute_query(restricao, database_=banco)
@@ -626,6 +800,8 @@ def montar_grafo(db, conexao, driver, banco):
         tx.run(CYPHER_ATENDIMENTOS, linhas=atendimentos)
         tx.run(CYPHER_DIAGNOSTICOS, linhas=diagnosticos)
         tx.run(CYPHER_PRESCRICOES, linhas=prescricoes)
+        tx.run(CYPHER_INTERACOES, linhas=INTERACOES_MEDICAMENTOSAS)
+        tx.run(CYPHER_CONTRAINDICACOES, linhas=CONTRAINDICACOES)
 
     with driver.session(database=banco) as sessao:
         sessao.execute_write(gravar)
@@ -730,7 +906,10 @@ def semear(conexao, db):
         chave: db.pacientes.insert_one(paciente).inserted_id
         for chave, paciente in PACIENTES.items()
     }
-    consultas = {chave: ObjectId() for chave in ("ana", "carlos_1", "carlos_2")}
+    consultas = {
+        chave: ObjectId()
+        for chave in ("ana", "carlos_enxaqueca", "carlos_1", "carlos_2", "mariana")
+    }
     db.prontuarios.insert_many(montar_prontuarios(pacientes, medicos, consultas))
     db.agendamentos.insert_many(montar_agendamentos(pacientes, medicos, consultas))
 

@@ -1,25 +1,34 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 
 from repositories.mongo_repository import MongoRepository
+from repositories.neo4j_repository import Neo4jRepository
+from services.mapeamento_clinico_service import (
+    MapeamentoClinicoService,
+    normalizar_medicamento,
+)
 from services.usuario_service import UsuarioService
 
+COLECAO_AGENDAMENTOS = "agendamentos"
+COLECAO_PACIENTES = "pacientes"
 COLECAO_PRONTUARIOS = "prontuarios"
 STATUS_AGENDADO = "Agendado"
 STATUS_EM_ANDAMENTO = "Em andamento"
 STATUS_CONCLUIDO = "Concluído"
-
+STATUS_AGENDAMENTO_CONFIRMADO = "confirmado"
+DURACAO_CONSULTA = timedelta(minutes=30)
 
 def _filtro_da_consulta(consulta_id):
     return [{"consulta._id": consulta_id}]
 
-
 class ProntuarioService:
     def __init__(
-        self, mongo_repository: MongoRepository, usuario_service: UsuarioService
+        self, mongo_repository: MongoRepository, usuario_service: UsuarioService, neo4j_repository: Neo4jRepository
     ):
         self.mongo_repository = mongo_repository
+        # O grafo do Mapeamento Clínico recebe as consultas criadas.
+        self.mapeamento_clinico_service = MapeamentoClinicoService(neo4j_repository)
         self.usuario_service = usuario_service
 
     def atualizar_anexo(self, paciente_id, consulta_id, arquivo):
@@ -42,10 +51,28 @@ class ProntuarioService:
         return resultado.matched_count > 0
 
     def atualizar_diagnosticos(self, paciente_id, consulta_id, diagnosticos):
+        filtro = {"paciente_id": paciente_id, "consultas._id": consulta_id}
+        # O médico da consulta é gravado no relacionamento do grafo.
+        prontuario = self.mongo_repository.find_document(
+            COLECAO_PRONTUARIOS, filtro, {"consultas.$": 1}
+        )
+        if not prontuario:
+            return False
+        paciente = self.mongo_repository.find_document(
+            COLECAO_PACIENTES, {"_id": paciente_id}
+        )
+
         resultado = self.mongo_repository.update_document(
             COLECAO_PRONTUARIOS,
-            {"paciente_id": paciente_id, "consultas._id": consulta_id},
+            filtro,
             {"$set": {"consultas.$.diagnosticos": diagnosticos}},
+        )
+
+        self.mapeamento_clinico_service.atualizar_diagnosticos(
+            paciente,
+            consulta_id,
+            prontuario["consultas"][0]["medico_id"],
+            diagnosticos,
         )
         return resultado.matched_count > 0
 
@@ -53,11 +80,19 @@ class ProntuarioService:
         self,
         paciente_id,
         medico_id,
+        horario_inicio,
         queixa_principal,
         sintomas,
         diagnosticos,
         observacoes,
     ):
+        paciente = self.mongo_repository.find_document(
+            COLECAO_PACIENTES, {"_id": paciente_id}
+        )
+        medico = {
+            "id": medico_id,
+            "nome": self.usuario_service.obter_nomes([medico_id]).get(medico_id),
+        }
         consulta = {
             "_id": ObjectId(),
             "medico_id": medico_id,
@@ -81,6 +116,20 @@ class ProntuarioService:
             },
             upsert=True,
         )
+        # O agendamento leva a consulta para a agenda do dia do médico.
+        self.mongo_repository.insert_document(
+            COLECAO_AGENDAMENTOS,
+            {
+                "paciente_id": paciente_id,
+                "medico_id": medico_id,
+                "consulta_id": consulta["_id"],
+                "horario_inicio": horario_inicio,
+                "horario_fim": horario_inicio + DURACAO_CONSULTA,
+                "status": STATUS_AGENDAMENTO_CONFIRMADO,
+            },
+        )
+
+        self.mapeamento_clinico_service.registrar_consulta(paciente, medico, consulta)
         return resultado.acknowledged
 
     def obter_consultas_agendadas(self):
@@ -150,7 +199,14 @@ class ProntuarioService:
                 consulta["medico_nome"] = nome
         return consultas
 
-    def finalizar_consulta(self, paciente_id, consulta_id, arquivo, receita):
+    def finalizar_consulta(
+        self, paciente_id, consulta_id, arquivo, receita, prescricoes=()
+    ):
+        """
+        Conclui a consulta com o laudo e a receita e acrescenta as prescrições
+        (nome, dosagem, frequência e orientações) ao prontuário. As prescrições
+        também vão para o grafo, onde são verificadas pelos alertas de segurança.
+        """
         laudo = {
             "nome_arquivo": arquivo.name,
             "tipo_arquivo": arquivo.type,
@@ -159,6 +215,17 @@ class ProntuarioService:
             "data_upload": datetime.now(timezone.utc),
             "descricao": "Laudo de finalização da consulta",
         }
+        prescricoes = [
+            {
+                **prescricao,
+                "nome": normalizar_medicamento(prescricao["nome"]),
+                "consulta_id": consulta_id,
+            }
+            for prescricao in prescricoes
+        ]
+        paciente = self.mongo_repository.find_document(
+            COLECAO_PACIENTES, {"_id": paciente_id}
+        )
         resultado = self.mongo_repository.update_document(
             COLECAO_PRONTUARIOS,
             {
@@ -174,11 +241,21 @@ class ProntuarioService:
                     "consultas.$[consulta].data_finalizacao": datetime.now(timezone.utc),
                     "data_atualizacao": datetime.now(timezone.utc),
                 },
-                "$push": {"consultas.$[consulta].exames_laudos": laudo},
+                "$push": {
+                    "consultas.$[consulta].exames_laudos": laudo,
+                    "prescricoes": {"$each": prescricoes},
+                },
             },
             array_filters=_filtro_da_consulta(consulta_id),
         )
-        return resultado.matched_count > 0
+        if resultado.matched_count == 0:
+            return False
+
+        if prescricoes:
+            self.mapeamento_clinico_service.registrar_prescricoes(
+                paciente, consulta_id, prescricoes
+            )
+        return True
 
     def obter_prontuario_por_paciente(self, paciente_id):
         prontuario = self.mongo_repository.find_document(
