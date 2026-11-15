@@ -1,296 +1,168 @@
-# Plataforma de Telemedicina
+# Plataforma de Telemedicina & Gestão de Prontuários Médicos 👨‍⚕️📄
 
-## Infraestrutura local
+**Estudo de Caso 03: Plataforma de Telemedicina & Gestão de Prontuários Médicos**, desenvolvido na disciplina **Implementação e Gerenciamento de Bancos de Dados NoSQL**, ministrada pelo professor Ricardo Roberto.
 
-Para iniciar PostgreSQL, MongoDB, Redis e Neo4j:
+A aplicação, feita em Python com Streamlit, cobre o ciclo de uma teleconsulta: 
+1. login de médicos e recepcionistas
+2. criação da consulta e do prontuário
+3. fila da recepção virtual, 
+4. finalização com laudo e prescrições
+5. mapeamento clínico com alertas de segurança. 
 
-```bash
-docker compose up -d
+Os dados ficam em quatro bancos, cada um escolhido pelo tipo de dado que guarda: PostgreSQL, MongoDB, Redis e Neo4j.
+
+## Equipe
+
+- Ismar Ferreira de Macêdo Neto
+- Davi Medeiros Dantas Soares
+- Augusto Luiz Lima Dantas
+- Guilherme Di Lorenzo Pereira
+- Lucca de Sena Barbosa
+- Ryan Emanuel Lima Miranda
+
+## Sumário
+
+- [Funcionalidades](#funcionalidades)
+- [Persistência poliglota](#persistência-poliglota)
+- [Como executar](#como-executar)
+- [Estrutura do projeto](#estrutura-do-projeto)
+- [PostgreSQL: usuários e acesso](#postgresql-usuários-e-acesso)
+- [MongoDB: médicos, pacientes, prontuários e agendamentos](#mongodb-médicos-pacientes-prontuários-e-agendamentos)
+- [Recepção Virtual: fila e agenda](#recepção-virtual-fila-e-agenda)
+- [Finalização de Consultas](#finalização-de-consultas)
+- [Mapeamento Clínico e alertas de segurança (Neo4j)](#mapeamento-clínico-e-alertas-de-segurança-neo4j)
+- [Redis: fila de espera e sessões](#redis-fila-de-espera-e-sessões)
+
+## Funcionalidades
+
+| Tela | O que faz | Bancos usados |
+|---|---|---|
+| **Login** | Autentica médicos e recepcionistas e abre a sessão | PostgreSQL, Redis |
+| **Atendimento Médico** | Cria consultas com data e horário, mostra o histórico do paciente, edita diagnósticos e anexa documentos em PDF | PostgreSQL, MongoDB, Neo4j, Redis |
+| **Recepção Virtual** | Fila de espera, chamada do próximo paciente, agenda do dia, consultas em atendimento e sessões ativas | Redis, MongoDB, PostgreSQL |
+| **Consultas** (Finalização) | Finaliza a consulta com laudo, receita e prescrições | MongoDB, Neo4j, Redis |
+| **Mapeamento Clínico** | Alertas de segurança, diagnósticos correlacionados e grafos de relações clínicas | Neo4j |
+
+## Persistência poliglota
+
+O projeto divide os dados da seguinte forma:
+
+```mermaid
+flowchart LR
+    UI["Telas Streamlit"] --> S["Serviços<br/>(src/services)"]
+    S --> PG[("PostgreSQL<br/>usuários e acesso")]
+    S --> MG[("MongoDB<br/>pacientes, prontuários,<br/>agendamentos, médicos")]
+    S --> RD[("Redis<br/>fila, sessões e cache")]
+    S --> NJ[("Neo4j<br/>grafo clínico")]
 ```
 
-## Gerar dados iniciais
+### O papel de cada banco
 
-Com os containers em execução, gere a tabela de usuários no PostgreSQL, as
-coleções (incluindo a de detalhes dos médicos), os validadores e os dados de
-exemplo no MongoDB e o grafo no Neo4j. O mesmo script também carrega no Redis
-o cache das agendas futuras:
+| Banco | O que guarda | Por que esse banco |
+|---|---|---|
+| **PostgreSQL** (relacional) | Tabela `usuarios`: nome, CPF, e-mail, senha, cargo e status de médicos e recepcionistas | Dados de acesso têm estrutura fixa e exigem integridade: `UNIQUE` em CPF e e-mail, `CHECK` em cargo e status e transações ACID. O `id` gerado aqui identifica o usuário em todos os outros bancos. |
+| **MongoDB** (documentos) | Coleções `medicos`, `pacientes`, `prontuarios` e `agendamentos` | O prontuário é naturalmente um documento: cada paciente tem um, com as consultas embutidas (sintomas, diagnósticos, laudos em binário e receita) e as prescrições. O esquema é flexível, mas validado com `$jsonSchema`, e as telas usam pipelines de `aggregate`. |
+| **Redis** (chave-valor em memória) | Fila de espera, sessões de usuários, tokens das consultas ativas e cache das agendas | São dados de acesso frequente e vida curta. O Redis responde em memória, tem estruturas prontas (Sorted Set para a fila, Hash para os dados de cada entrada) e expira as chaves sozinho com TTL. |
+| **Neo4j** (grafo) | Nós `Paciente`, `Medico`, `Diagnostico` e `Medicamento`, ligados por atendimentos, diagnósticos, prescrições, interações e contraindicações | Os alertas e as correlações percorrem relacionamentos em vários níveis (paciente → medicamento → interação → outro medicamento; diagnóstico → paciente → diagnóstico). Em grafo, essas buscas são travessias diretas em Cypher, como `shortestPath`, em vez de várias junções. |
 
-```bash
-python src/config/seed.py
+### Como os bancos se referenciam
+
+A ligação é feita pelos identificadores, guardados como campos comuns e resolvidos pela aplicação:
+
+| Identificador de origem | Onde aparece |
+|---|---|
+| `usuarios.id` (PostgreSQL) | MongoDB: `medicos.usuario_id`, `prontuarios.consultas.medico_id` e `agendamentos.medico_id`; Redis: `usuario_id` da sessão e chave `agenda:medico:<id>:<AAAA-MM-DD>`; Neo4j: propriedade `postgres_id` dos nós `(:Medico)` |
+| `pacientes._id` (MongoDB) | MongoDB: `prontuarios.paciente_id` e `agendamentos.paciente_id`; Redis: `paciente_id` em `fila:consulta:<id>`; Neo4j: propriedade `mongo_id` dos nós `(:Paciente)` |
+| `prontuarios.consultas._id` (MongoDB) | MongoDB: `agendamentos.consulta_id` e `prescricoes.consulta_id`; Redis: membro de `fila:espera` e chaves `fila:consulta:<id>` e `sessao_consulta:<id>`; Neo4j: propriedade `consulta_id` dos relacionamentos |
+
+
+### Camada de acesso
+
+- `src/config/database.py` abre uma conexão (ou pool) por banco, guardada com
+  `st.cache_resource` para ser reaproveitada entre as execuções das telas.
+- `src/repositories` isola a comunicação com cada banco: `PostgresRepository`,
+  `MongoRepository` e `Neo4jRepository` (o Redis é usado pelo cliente
+  `redis-py` diretamente nos serviços).
+- `src/services` contém as regras de negócio e é onde os bancos se encontram:
+
+| Serviço | Bancos |
+|---|---|
+| `UsuarioService` | PostgreSQL e MongoDB |
+| `ProntuarioService` | MongoDB, Neo4j (pelo `MapeamentoClinicoService`) e PostgreSQL (pelo `UsuarioService`) |
+| `MapeamentoClinicoService` | Neo4j |
+| `AgendaCacheService` | Redis e MongoDB |
+| `FilaService` e `SessaoService` | Redis |
+
+
+## Estrutura do projeto
+
+```text
+src/
+├── app.py            # login e navegação entre as telas
+├── config/
+│   ├── database.py   # conexões com os quatro bancos
+│   └── seed.py       # cria estruturas e dados de exemplo
+├── pages/            # uma pasta por tela do Streamlit
+├── repositories/     # acesso ao PostgreSQL, MongoDB e Neo4j
+├── services/         # regras de negócio e integração entre os bancos
+└── tests/            # testes unitários com repositórios falsos
 ```
 
-O script apaga os dados existentes e recria tudo a cada execução. Como ele
-também zera o Redis (fila, sessões e cache), é preciso entrar de novo no app.
 
-Se você tem os bancos de uma versão anterior do projeto, apague os volumes e
-suba os containers de novo antes de rodar o script:
+## Como executar
+
+### Pré-requisitos
+
+- Docker com Docker Compose
+- Python 3.12 ou superior
+
+### 1. Preparar o ambiente
+
+Na raiz do projeto, crie o ambiente virtual, instale as dependências e copie os arquivos de configuração de exemplo:
 
 ```bash
-docker compose down -v
-docker compose up -d
-```
-
-## Executar localmente (Windows PowerShell)
-
-Na raiz do projeto, crie o ambiente Python, instale as dependências e prepare
-os arquivos locais de configuração:
-
-```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-if (-not (Test-Path .env)) { Copy-Item .env-example .env }
-if (-not (Test-Path .streamlit\secrets.toml)) {
-    Copy-Item .streamlit\secrets-example.toml .streamlit\secrets.toml
-}
+source .venv/bin/activate   # no Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env-example .env
+cp .streamlit/secrets-example.toml .streamlit/secrets.toml
 ```
 
-Confirme que as credenciais de `.env` correspondem às URLs e credenciais em
-`.streamlit\secrets.toml`. Suba os bancos, gere os dados e inicie o Streamlit:
+O `.env` define as credenciais dos containers e o `.streamlit/secrets.toml`, as URLs usadas pela aplicação.
 
-```powershell
+### 2. Subir os bancos
+
+```bash
 docker compose up -d
+```
+
+| Serviço | Endereço |
+|---|---|
+| PostgreSQL 17 | `localhost:5433` (a porta 5432 fica livre para um PostgreSQL instalado na máquina) |
+| MongoDB 8 | `localhost:27018` |
+| Redis 7 | `localhost:6379` |
+| Neo4j 5 Browser | `http://localhost:7474` |
+| Neo4j 5 Bolt | `bolt://localhost:7687` |
+
+As credenciais vêm das variáveis `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+`POSTGRES_DB`, `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`, `REDIS_PASSWORD` e
+`NEO4J_AUTH` do `.env`.
+
+### 3. Gerar os dados de exemplo
+
+```bash
 python src/config/seed.py
-$env:PYTHONPATH = "src"
+```
+
+O script cria a tabela `usuarios` no PostgreSQL, as coleções com validadores e
+índices no MongoDB, o grafo e o catálogo clínico no Neo4j e o cache das agendas
+futuras no Redis. Ele apaga os dados existentes e recria tudo a cada execução;
+como também zera o Redis (fila, sessões e cache), é preciso entrar de novo na
+aplicação.
+
+
+### 4. Iniciar a aplicação
+
+```bash
 streamlit run src/app.py
 ```
-
-Para executar os testes, em outro terminal com o mesmo
-ambiente virtual ativado:
-
-```powershell
-$env:PYTHONPATH = "src"
-python -m unittest discover -s src/tests -v
-```
-
-Serviços disponíveis:
-
-- PostgreSQL: `localhost:5433` (a porta 5432 fica livre para um PostgreSQL
-  instalado na máquina)
-- MongoDB: `localhost:27018`
-- Redis: `localhost:6379`
-- Neo4j Browser: `http://localhost:7474`
-- Neo4j Bolt: `bolt://localhost:7687`
-
-As credenciais podem ser sobrescritas com as variáveis `POSTGRES_USER`,
-`POSTGRES_PASSWORD`, `POSTGRES_DB`, `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`,
-`REDIS_PASSWORD` e `NEO4J_AUTH`.
-
-## Usuários no PostgreSQL e detalhes dos médicos no MongoDB
-
-A tabela `usuarios` do PostgreSQL, criada pelo `seed.py`, guarda só os dados
-usados no acesso à aplicação, de médicos e recepcionistas: `nome`, `cpf`,
-`email`, `senha`, `cargo` e `status`. CPF e e-mail são únicos. O `id` (`BIGINT`
-gerado pelo banco) é a referência usada pelos outros bancos:
-
-- MongoDB: `usuario_id` na coleção `medicos` e `medico_id` em
-  `prontuarios.consultas` e em `agendamentos`;
-- Redis: `usuario_id` da sessão e a chave `agenda:medico:<id>:<AAAA-MM-DD>`;
-- Neo4j: propriedade `postgres_id` dos nós `(:Medico)`, usada pela tela
-  **Mapeamento Clínico** para identificar os médicos.
-
-Os detalhes de cada médico ficam na coleção `medicos` do MongoDB:
-
-| Campo | Tipo | Obrigatório |
-|---|---|---|
-| `usuario_id` | inteiro: o `id` do médico na tabela `usuarios` | sim |
-| `crm` | texto | sim |
-| `uf_crm` | texto com 2 letras | sim |
-| `telefone` | inteiro | sim |
-| `especialidades` | lista de textos | não |
-| `data_cadastro` | data | não |
-
-O validador da coleção recusa documentos sem `usuario_id` (ou com valor que não
-seja inteiro positivo). O índice único em `usuario_id` garante um documento por
-médico, e o índice único em (`crm`, `uf_crm`) impede CRM repetido na mesma UF.
-
-O `UsuarioService` faz o login e busca os nomes dos médicos exibidos nas
-consultas no PostgreSQL, já que o MongoDB não consegue fazer `$lookup` em uma
-tabela do PostgreSQL. Para listar os médicos, junta os da tabela com o CRM da
-coleção `medicos`. O `criar_medico` grava o usuário e os detalhes na mesma
-transação do PostgreSQL: se a gravação no MongoDB falhar, o usuário não é
-criado.
-
-Quem já tinha o `.streamlit/secrets.toml` precisa acrescentar a ele a seção
-`[postgres]` do `.streamlit/secrets-example.toml`.
-
-## Recepção Virtual: fila e agenda
-
-A tela **Recepção Virtual** apresenta a fila ordenada por chegada, posição e
-tempo de espera. A recepção só pode adicionar à fila consultas com status
-`Agendado` no prontuário; **Chamar próximo paciente** retira o primeiro da fila,
-muda a consulta para `Em andamento`, cria o token de sessão da consulta e a
-exibe em **Consultas em atendimento**, com o token e o tempo até expirar. A
-tela lista também as sessões Redis ainda válidas e atualiza os dados
-automaticamente a cada 15 segundos (ou pelo botão **Atualizar agora**).
-
-Cada documento de `agendamentos` aponta para a consulta do prontuário pelo
-campo `consulta_id` (obrigatório nos agendamentos `confirmado` e
-`em_atendimento`). A **Agenda do dia** lista, para o médico e a data
-selecionados, as consultas referenciadas pelos agendamentos confirmados/em
-atendimento, com o intervalo `horario_inicio` - `horario_fim`, o paciente, a
-queixa principal e o status atual da consulta.
-
-Ao criar uma consulta na tela **Atendimento Médico**, o médico informa a data e
-o horário. O `ProntuarioService.criar_consulta` grava, além da consulta no
-prontuário, um agendamento `confirmado` de 30 minutos apontando para ela, e a
-tela descarta o cache daquele médico e dia. Assim, a consulta aparece na
-**Agenda do dia**.
-
-A agenda usa cache-aside: consulta primeiro
-`agenda:medico:<medico_id>:<AAAA-MM-DD>` no Redis e, em caso de ausência,
-monta a agenda no MongoDB e guarda o resultado por 12 horas. Como o cache
-guarda o status da consulta, ele precisa ser descartado sempre que um
-agendamento ou o status de uma consulta mudar:
-
-- `AgendaCacheService.invalidar_agenda_dia(medico_id, data)`: remove o cache
-  daquele médico e dia. É chamado ao criar uma consulta.
-- `AgendaCacheService.invalidar_agendas_da_consulta(consulta_id)`: remove o
-  cache de todos os dias em que a consulta está agendada. É chamado ao chamar o
-  próximo paciente e ao finalizar a consulta.
-
-O `seed.py` zera o Redis e carrega o cache das agendas futuras.
-
-## Finalização de Consultas
-
-A tela lista as consultas com status `Em andamento` e permite que o médico
-finalize cada uma anexando o laudo em PDF e, opcionalmente, as prescrições (uma
-linha por medicamento, com dosagem, frequência e orientações) e a receita ou
-orientações gerais. Quando não há consultas, exibe "Sem consultas a serem
-finalizadas".
-
-Ao finalizar uma consulta:
-
-1. **MongoDB** (`prontuarios`): o laudo é adicionado em
-   `consultas.exames_laudos` (`$push`), as prescrições são acrescentadas em
-   `prescricoes` com o `consulta_id`, a receita é salva em `consultas.receita`
-   e o status muda para `Concluído`.
-2. **Neo4j**: cada prescrição vira
-   `(:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)`, que os alertas de
-   segurança passam a verificar.
-3. **Redis**: a consulta é removida da fila de espera, o status na fila passa
-   para `Concluído` e o token de sessão da consulta é revogado.
-
-O histórico da tela **Atendimento Médico** mostra a receita de cada consulta e
-a lista de prescrições do paciente.
-
-Métodos usados (`ProntuarioService`):
-
-- `obter_consultas_em_andamento()`: aggregate com `$unwind`, `$match` e
-  `$lookup` para trazer as consultas em andamento com o paciente; o nome do
-  médico vem da tabela `usuarios` do PostgreSQL.
-- `finalizar_consulta(paciente_id, consulta_id, arquivo, receita, prescricoes)`:
-  grava o laudo e as prescrições e conclui a consulta. Retorna `False` se a
-  consulta não estiver mais em andamento.
-
-## Mapeamento Clínico e alertas de segurança (Neo4j)
-
-A tela lê o grafo que o `seed.py` monta a partir do PostgreSQL e do MongoDB:
-
-- `(:Medico)-[:ATENDEU]->(:Paciente)`
-- `(:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)`
-- `(:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento)`
-
-O `seed.py` grava também um catálogo clínico (`INTERACOES_MEDICAMENTOSAS` e
-`CONTRAINDICACOES`), que liga os medicamentos pelo nome usado nas prescrições e
-os diagnósticos pelo CID:
-
-- `(:Medicamento)-[:INTERAGE_COM {severidade, descricao}]->(:Medicamento)`
-- `(:Medicamento)-[:CONTRAINDICADO_PARA {severidade, motivo}]->(:Diagnostico)`
-
-Para o paciente selecionado, a tela mostra:
-
-- **Alertas de segurança**: alergia a um medicamento prescrito, interação entre
-  medicamentos prescritos, medicamento contraindicado para um diagnóstico do
-  paciente e prescrição duplicada.
-- **Diagnósticos correlacionados em cadeia**: dois diagnósticos se
-  correlacionam quando algum paciente tem os dois. A partir dos diagnósticos do
-  paciente, a busca segue essas ligações com `shortestPath` por até 3 níveis e
-  mostra o nível e a cadeia, por exemplo
-  `Enxaqueca sem aura → Asma → Rinite alérgica`.
-- **Grafo de relações clínicas** do paciente.
-
-No fim da tela, a **Teia de Diagnósticos da Clínica** mostra o grafo de todos
-os pacientes.
-
-Com os dados de exemplo:
-
-| Paciente | Diagnósticos | Alertas |
-|---|---|---|
-| Ana | Enxaqueca, asma | Propranolol contraindicado para asma; interação entre propranolol e salbutamol |
-| Carlos | Hipertensão, enxaqueca | Interação entre losartana e ibuprofeno |
-| Mariana | Asma, rinite alérgica | Nenhum |
-
-### Atualização do grafo pela aplicação
-
-O `ProntuarioService` grava no MongoDB e, em seguida, atualiza o grafo pelo
-`MapeamentoClinicoService`. Ao criar uma consulta (`registrar_consulta`):
-
-1. cria ou atualiza os nós `(:Paciente)` (dados da coleção `pacientes`) e
-   `(:Medico)` (id e nome da tabela `usuarios`);
-2. cria `(:Medico)-[:ATENDEU {consulta_id, queixa_principal, sintomas}]->(:Paciente)`;
-3. para cada diagnóstico, cria o nó `(:Diagnostico)` se ainda não existir e
-   `(:Paciente)-[:DIAGNOSTICADO_COM {consulta_id, medico_id}]->(:Diagnostico)`.
-
-O diagnóstico é identificado pelo CID escrito no fim do texto, como em
-`Asma (CID J45.9)`; sem CID, o próprio nome vira o código. A mesma regra
-(`separar_cid`) é usada pelo `seed.py`. Os métodos de escrita do
-`Neo4jRepository` usam `MERGE`, então os nós que já existem são reaproveitados.
-
-Ao editar os diagnósticos de uma consulta no Atendimento
-(`atualizar_diagnosticos`), os relacionamentos `DIAGNOSTICADO_COM` daquela
-consulta são removidos e criados de novo com a lista editada.
-
-Ao finalizar uma consulta com prescrições (`registrar_prescricoes`), cada
-medicamento vira `(:Paciente)-[:RECEBEU_PRESCRICAO {consulta_id, dosagem,
-frequencia, orientacoes}]->(:Medicamento)`. O nome é padronizado com a primeira
-letra maiúscula (`ibuprofeno` → `Ibuprofeno`), como no catálogo clínico, para
-que as interações e contraindicações sejam encontradas.
-
-Se o Neo4j falhar, os dados continuam gravados no MongoDB e a tela avisa que
-não foi possível atualizar o Mapeamento Clínico.
-
-## Fila de espera no Redis
-
-A fila da recepção virtual é compartilhada entre as telas de Recepção Virtual
-e Finalização de Consultas através do `FilaService`
-(`src/services/fila_service.py`).
-
-| Chave | Tipo | Conteúdo |
-|---|---|---|
-| `fila:espera` | Sorted Set | membro = id da consulta, score = horário de chegada (timestamp) |
-| `fila:consulta:<id>` | Hash | `paciente_id`, `paciente_nome`, `status`, `chegada` |
-
-Status na fila: `Aguardando` → `Em andamento` → `Concluído`. Ao ser concluída, a consulta sai
-do Sorted Set e o hash expira em 24 horas.
-
-Métodos:
-
-- `adicionar_na_fila(consulta_id, paciente_id, paciente_nome)`: coloca a
-  consulta no fim da fila com status `Aguardando`.
-- `obter_fila()`: retorna a fila em ordem de chegada.
-- `remover_da_fila(consulta_id)`: tira a consulta da fila e marca como
-  `Concluído`.
-
-## Sessões de usuários no Redis
-
-Após o login validado no PostgreSQL, o sistema cria um token aleatório e armazena
-no Redis somente o hash desse token. A sessão usa a chave
-`sessao:<hash_do_token>`, contém os dados mínimos do usuário e expira após 8
-horas. Cada validação renova o TTL; o botão `Sair` revoga a sessão removendo a
-chave do Redis.
-
-Essa implementação está no `SessaoService`
-(`src/services/sessao_service.py`), enquanto o token permanece apenas no
-`st.session_state` da sessão ativa do Streamlit.
-
-### Sessões das consultas ativas
-
-Quando a recepção chama o próximo paciente e a consulta passa para
-`Em andamento`, o `SessaoService.criar_sessao_consulta` cria um token aleatório
-para a sala da teleconsulta e o guarda em `sessao_consulta:<consulta_id>`, com
-expiração de 2 horas. A chave fica fora do prefixo `sessao:`, que lista apenas
-as sessões de usuários. Diferente da sessão de usuário, o token fica guardado
-no Redis para que a recepção possa repassá-lo ao paciente; ele aparece em
-**Consultas em atendimento** e é revogado
-(`SessaoService.revogar_sessao_consulta`) ao finalizar a consulta.
