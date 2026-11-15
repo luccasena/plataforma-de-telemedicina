@@ -34,10 +34,8 @@ class ProntuarioService:
             COLECAO_PRONTUARIOS,
             {"paciente_id": paciente_id, "consultas._id": consulta_id},
             {
-                "$set": {
-                    "consultas.$[consulta].exames_laudos": [anexo],
-                    "data_atualizacao": datetime.now(timezone.utc),
-                }
+                "$push": {"consultas.$[consulta].exames_laudos": anexo},
+                "$set": {"data_atualizacao": datetime.now(timezone.utc)},
             },
             array_filters=_filtro_da_consulta(consulta_id),
         )

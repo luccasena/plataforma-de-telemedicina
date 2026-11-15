@@ -137,7 +137,9 @@ def _atualizar_anexo(paciente_id, consulta_id, arquivo):
     if not atualizado:
         st.error("O prontuário não foi encontrado para atualização.")
         return
-
+    
+    chave_versao = f"versao_anexo_{consulta_id}"
+    st.session_state[chave_versao] = st.session_state.get(chave_versao, 0) + 1
     st.success("Documento anexado.")
     st.rerun()
 
@@ -159,10 +161,11 @@ def _exibir_consulta(paciente_id, consulta, numero):
         if salvar:
             _atualizar_diagnosticos(paciente_id, consulta["_id"], diagnosticos)
 
+        versao_anexo = st.session_state.get(f"versao_anexo_{consulta['_id']}", 0)
         arquivo = st.file_uploader(
             "Anexar documento PDF",
             type=["pdf"],
-            key=f"anexo_{consulta['_id']}",
+            key=f"anexo_{consulta['_id']}_{versao_anexo}",
             help="Tamanho máximo: 16 MB, conforme o limite do MongoDB.",
         )
         if arquivo is not None and st.button(
