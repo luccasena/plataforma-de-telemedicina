@@ -73,7 +73,12 @@ class FilaService:
         pipeline.execute()
 
     def descartar(self, consulta_id):
-        """Remove da fila uma entrada que não corresponde a consulta agendada."""
+        """Remove da fila sem iniciar atendimento.
+
+        Usado para entradas que não correspondem a consulta agendada e para
+        desfazer uma inclusão feita por engano. A consulta no MongoDB não é
+        alterada, então ela pode voltar a ser adicionada à fila depois.
+        """
         pipeline = self.redis_client.pipeline()
         pipeline.zrem(CHAVE_FILA, str(consulta_id))
         pipeline.delete(f"{PREFIXO_CONSULTA}{consulta_id}")
