@@ -311,7 +311,7 @@ class MapeamentoClinicoService:
                 if not medico:
                     continue
 
-                m_raw_id = medico.get("mongo_id") or medico.get("id")
+                m_raw_id = medico.get("postgres_id")
                 m_id = f"medico_{m_raw_id}" if m_raw_id else f"medico_{medico.get('crm', 'desconhecido')}"
                 if m_id not in nos_map:
                     nos_map[m_id] = {
@@ -452,7 +452,7 @@ class MapeamentoClinicoService:
                     rel = item.get("rel")
                     if not medico:
                         continue
-                    m_raw_id = medico.get("mongo_id") or medico.get("id")
+                    m_raw_id = medico.get("postgres_id")
                     m_id = f"medico_{m_raw_id}" if m_raw_id else f"medico_{medico.get('crm', 'desconhecido')}"
                     if m_id not in nos_map:
                         nos_map[m_id] = {

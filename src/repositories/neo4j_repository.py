@@ -255,10 +255,11 @@ class Neo4jRepository:
     def buscar_medicos_paciente(self, paciente_id: str) -> List[Dict[str, Any]]:
         """
         Recupera os médicos que atenderam o paciente (:Medico)-[:ATENDEU]->(:Paciente).
+        O id do médico é o da tabela usuarios do PostgreSQL (propriedade postgres_id).
         """
         cypher = """
         MATCH (m:Medico)-[r:ATENDEU]->(p:Paciente {mongo_id: $paciente_id})
-        RETURN m.mongo_id AS id,
+        RETURN m.postgres_id AS id,
                m.nome AS nome,
                m.crm AS crm,
                m.uf_crm AS uf_crm,
