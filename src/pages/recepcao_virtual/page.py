@@ -136,10 +136,20 @@ def _exibir_fila():
         for consulta in fila:
             chegada = float(consulta.get("chegada", agora))
             espera_minutos = max(0, int((agora - chegada) // 60))
-            st.write(
-                f"**{consulta['posicao']}. {consulta.get('paciente_nome', 'Paciente')}**"
+            paciente_nome = consulta.get("paciente_nome", "Paciente")
+            coluna_texto, coluna_acao = st.columns([5, 1])
+            coluna_texto.write(
+                f"**{consulta['posicao']}. {paciente_nome}**"
                 f" — aguardando há {espera_minutos} min"
             )
+            if coluna_acao.button(
+                "Remover",
+                key=f"remover_fila_{consulta['consulta_id']}",
+                help="Retira o paciente da fila, por exemplo se foi incluído por engano.",
+            ):
+                fila_service.descartar(consulta["consulta_id"])
+                st.toast(f"{paciente_nome} foi removido(a) da fila.")
+                st.rerun()
 
     if st.button("Chamar próximo paciente", type="primary"):
         _chamar_proximo()
