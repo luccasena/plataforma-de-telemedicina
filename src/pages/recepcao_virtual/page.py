@@ -3,13 +3,20 @@ from datetime import date, datetime, timedelta, timezone
 import streamlit as st
 from bson import ObjectId
 from bson.errors import InvalidId
+from psycopg import Error as PostgresError
 from pymongo.errors import PyMongoError
 from redis.exceptions import RedisError
 
-from config.database import conectar_redis, obter_mongo_repository
+from config.database import (
+    conectar_redis,
+    obter_mongo_repository,
+    obter_neo4j_repository,
+    obter_postgres_repository,
+)
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
+from services.sessao_service import SessaoService
 from services.usuario_service import UsuarioService
 
 
@@ -17,9 +24,12 @@ FUSO_BRASILIA = timezone(timedelta(hours=-3))
 mongo_repository = obter_mongo_repository()
 redis_client = conectar_redis()
 fila_service = FilaService(redis_client)
+sessao_service = SessaoService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
-prontuario_service = ProntuarioService(mongo_repository)
-usuario_service = UsuarioService(mongo_repository)
+usuario_service = UsuarioService(obter_postgres_repository(), mongo_repository)
+prontuario_service = ProntuarioService(
+    mongo_repository, usuario_service, obter_neo4j_repository()
+)
 
 
 def _formatar_horario(valor):
@@ -104,9 +114,13 @@ def _chamar_proximo():
         return
 
     try:
+        sessao_service.criar_sessao_consulta(proximo["consulta_id"])
         agenda_cache_service.invalidar_agendas_da_consulta(consulta_id)
     except (PyMongoError, RedisError):
-        st.toast("Consulta iniciada, mas não foi possível atualizar a agenda do dia.")
+        st.toast(
+            "Consulta iniciada, mas não foi possível criar a sessão da consulta "
+            "ou atualizar a agenda do dia."
+        )
 
     st.toast(f"Paciente chamado: {paciente_nome}. Consulta em andamento.")
     st.rerun()
@@ -143,7 +157,7 @@ def _exibir_agenda(medicos):
         medicos_visiveis = [
             medico
             for medico in medicos
-            if str(medico["_id"]) == usuario.get("usuario_id")
+            if str(medico["id"]) == usuario.get("usuario_id")
         ]
         if not medicos_visiveis:
             st.warning("Não foi possível localizar o médico da sessão.")
@@ -156,7 +170,7 @@ def _exibir_agenda(medicos):
     medico = opcoes[st.selectbox("Médico", list(opcoes))]
     dia_agenda = st.date_input("Data", value=date.today(), key="agenda_data")
     try:
-        agenda = agenda_cache_service.obter_agenda_dia(medico["_id"], dia_agenda)
+        agenda = agenda_cache_service.obter_agenda_dia(medico["id"], dia_agenda)
     except (PyMongoError, RedisError):
         st.error("Não foi possível carregar a agenda do dia.")
         return
@@ -190,9 +204,16 @@ def _exibir_consultas_ativas():
         st.info("Não há consultas em atendimento.")
         return
     for consulta in consultas:
+        sessao = sessao_service.obter_sessao_consulta(consulta["consulta_id"])
+        if sessao is None:
+            descricao_sessao = "sessão expirada"
+        else:
+            descricao_sessao = (
+                f"token da sessão `{sessao['token']}`, "
+                f"expira em {sessao['expira_em'] // 60} min"
+            )
         st.write(
-            f"**{consulta.get('paciente_nome', 'Paciente')}** "
-            f"— sessão {consulta['consulta_id'][:8]}"
+            f"**{consulta.get('paciente_nome', 'Paciente')}** — {descricao_sessao}"
         )
 
 
@@ -224,7 +245,7 @@ def _exibir_painel():
         _exibir_agenda(medicos)
         _exibir_consultas_ativas()
         _exibir_sessoes_ativas()
-    except PyMongoError:
+    except (PyMongoError, PostgresError):
         st.error("Não foi possível carregar os dados da recepção.")
     except RedisError:
         st.error("Não foi possível acessar a fila no Redis.")

@@ -79,6 +79,24 @@ class Neo4jRepository:
             logger.error("Erro ao executar consulta Cypher: %s | Query: %s", exc, cypher)
             raise
 
+    def _executar_escrita(self, cypher: str, parametros: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Executa um comando Cypher parametrizado em transação de escrita.
+
+        :param cypher: String contendo o comando Cypher.
+        :param parametros: Dicionário de parâmetros Cypher.
+        """
+        if not self.driver:
+            raise ServiceUnavailable("Driver do Neo4j não está disponível.")
+
+        parametros = parametros or {}
+        try:
+            with self.driver.session(database=self.database_name) as session:
+                session.execute_write(lambda tx: tx.run(cypher, parametros).consume())
+        except (Neo4jError, ServiceUnavailable) as exc:
+            logger.error("Erro ao executar escrita Cypher: %s | Query: %s", exc, cypher)
+            raise
+
     # -------------------------------------------------------------------------
     # 1. Consultas de Pacientes
     # -------------------------------------------------------------------------
@@ -118,9 +136,106 @@ class Neo4jRepository:
         resultados = self._executar_leitura(cypher, {"paciente_id": str(paciente_id)})
         return resultados[0] if resultados else None
 
+    def criar_paciente(self, paciente_id: str, dados: Dict[str, Any]) -> None:
+        """
+        Cria o nó (:Paciente) identificado pelo mongo_id ou atualiza os dados dele.
+        """
+        cypher = """
+        MERGE (p:Paciente {mongo_id: $paciente_id})
+        SET p += $dados
+        """
+        self._executar_escrita(cypher, {"paciente_id": str(paciente_id), "dados": dados})
+
     # -------------------------------------------------------------------------
     # 2. Diagnósticos e Médicos
     # -------------------------------------------------------------------------
+
+    def criar_medico(self, medico_id: int, dados: Dict[str, Any]) -> None:
+        """
+        Cria o nó (:Medico) identificado pelo postgres_id (id na tabela usuarios)
+        ou atualiza os dados dele.
+        """
+        cypher = """
+        MERGE (m:Medico {postgres_id: $medico_id})
+        SET m += $dados
+        """
+        self._executar_escrita(cypher, {"medico_id": medico_id, "dados": dados})
+
+    def criar_atendimento(
+        self,
+        medico_id: int,
+        paciente_id: str,
+        consulta_id: str,
+        queixa_principal: Optional[str],
+        sintomas: List[str],
+    ) -> None:
+        """
+        Cria o relacionamento (:Medico)-[:ATENDEU]->(:Paciente) da consulta.
+        Os nós do médico e do paciente precisam existir.
+        """
+        cypher = """
+        MATCH (m:Medico {postgres_id: $medico_id})
+        MATCH (p:Paciente {mongo_id: $paciente_id})
+        MERGE (m)-[r:ATENDEU {consulta_id: $consulta_id}]->(p)
+        SET r.queixa_principal = $queixa_principal,
+            r.sintomas = $sintomas
+        """
+        self._executar_escrita(
+            cypher,
+            {
+                "medico_id": medico_id,
+                "paciente_id": str(paciente_id),
+                "consulta_id": str(consulta_id),
+                "queixa_principal": queixa_principal,
+                "sintomas": sintomas,
+            },
+        )
+
+    def criar_diagnostico(
+        self,
+        paciente_id: str,
+        consulta_id: str,
+        medico_id: int,
+        codigo: str,
+        nome: str,
+        cid: Optional[str],
+    ) -> None:
+        """
+        Cria o nó (:Diagnostico), se ainda não existir, e o relacionamento
+        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico) da consulta.
+        O diagnóstico é identificado pelo código (o CID ou, sem CID, o nome).
+        """
+        cypher = """
+        MATCH (p:Paciente {mongo_id: $paciente_id})
+        MERGE (d:Diagnostico {codigo: $codigo})
+        ON CREATE SET d.nome = $nome, d.cid = $cid
+        MERGE (p)-[r:DIAGNOSTICADO_COM {consulta_id: $consulta_id}]->(d)
+        SET r.medico_id = $medico_id
+        """
+        self._executar_escrita(
+            cypher,
+            {
+                "paciente_id": str(paciente_id),
+                "consulta_id": str(consulta_id),
+                "medico_id": medico_id,
+                "codigo": codigo,
+                "nome": nome,
+                "cid": cid,
+            },
+        )
+
+    def remover_diagnosticos_consulta(self, paciente_id: str, consulta_id: str) -> None:
+        """
+        Remove os relacionamentos (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico)
+        da consulta. Os nós (:Diagnostico) continuam no grafo.
+        """
+        cypher = """
+        MATCH (:Paciente {mongo_id: $paciente_id})-[r:DIAGNOSTICADO_COM {consulta_id: $consulta_id}]->(:Diagnostico)
+        DELETE r
+        """
+        self._executar_escrita(
+            cypher, {"paciente_id": str(paciente_id), "consulta_id": str(consulta_id)}
+        )
 
     def buscar_diagnosticos_paciente(self, paciente_id: str) -> List[Dict[str, Any]]:
         """
@@ -140,10 +255,11 @@ class Neo4jRepository:
     def buscar_medicos_paciente(self, paciente_id: str) -> List[Dict[str, Any]]:
         """
         Recupera os médicos que atenderam o paciente (:Medico)-[:ATENDEU]->(:Paciente).
+        O id do médico é o da tabela usuarios do PostgreSQL (propriedade postgres_id).
         """
         cypher = """
         MATCH (m:Medico)-[r:ATENDEU]->(p:Paciente {mongo_id: $paciente_id})
-        RETURN m.mongo_id AS id,
+        RETURN m.postgres_id AS id,
                m.nome AS nome,
                m.crm AS crm,
                m.uf_crm AS uf_crm,
@@ -173,6 +289,40 @@ class Neo4jRepository:
         ORDER BY m.nome ASC
         """
         return self._executar_leitura(cypher, {"paciente_id": str(paciente_id)})
+
+    def criar_prescricao(
+        self,
+        paciente_id: str,
+        consulta_id: str,
+        nome: str,
+        dosagem: Optional[str],
+        frequencia: Optional[str],
+        orientacoes: Optional[str],
+    ) -> None:
+        """
+        Cria o nó (:Medicamento), se ainda não existir, e o relacionamento
+        (:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento) da consulta.
+        O medicamento é identificado pelo nome, como no catálogo clínico.
+        """
+        cypher = """
+        MATCH (p:Paciente {mongo_id: $paciente_id})
+        MERGE (m:Medicamento {nome: $nome})
+        MERGE (p)-[r:RECEBEU_PRESCRICAO {consulta_id: $consulta_id}]->(m)
+        SET r.dosagem = $dosagem,
+            r.frequencia = $frequencia,
+            r.orientacoes = $orientacoes
+        """
+        self._executar_escrita(
+            cypher,
+            {
+                "paciente_id": str(paciente_id),
+                "consulta_id": str(consulta_id),
+                "nome": nome,
+                "dosagem": dosagem,
+                "frequencia": frequencia,
+                "orientacoes": orientacoes,
+            },
+        )
 
     # -------------------------------------------------------------------------
     # 4. Alertas de Segurança e Incompatibilidades
@@ -255,23 +405,35 @@ class Neo4jRepository:
 
     def buscar_diagnosticos_correlacionados_paciente(self, paciente_id: str, limite: int = 10) -> List[Dict[str, Any]]:
         """
-        Identifica diagnósticos correlacionados aos diagnósticos do paciente especificado,
-        baseando-se na coocorrência epidemiológica entre outros pacientes no grafo.
+        Identifica, em cadeia, os diagnósticos correlacionados aos do paciente.
+
+        Dois diagnósticos se correlacionam quando algum paciente tem os dois. A busca
+        segue essas ligações pelo caminho mais curto, (:Diagnostico)<-[:DIAGNOSTICADO_COM]-
+        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico), por até 3 níveis
+        (*..6 relacionamentos). Nível 1 é a ligação direta; no nível 2, a cadeia passa
+        por um diagnóstico intermediário, e assim por diante. Diagnósticos que o
+        paciente já tem não entram no resultado.
         """
         cypher = """
-        MATCH (p:Paciente {mongo_id: $paciente_id})-[:DIAGNOSTICADO_COM]->(d1:Diagnostico)
-        MATCH (outro:Paciente)-[:DIAGNOSTICADO_COM]->(d1)
-        MATCH (outro)-[:DIAGNOSTICADO_COM]->(d2:Diagnostico)
-        WHERE d1.codigo <> d2.codigo
-        WITH d1, d2, count(DISTINCT outro) AS total_pacientes_compartilhados
-        RETURN d1.codigo AS diagnostico_origem_codigo,
-               d1.nome AS diagnostico_origem_nome,
-               d1.cid AS diagnostico_origem_cid,
-               d2.codigo AS diagnostico_correlacionado_codigo,
-               d2.nome AS diagnostico_correlacionado_nome,
-               d2.cid AS diagnostico_correlacionado_cid,
-               total_pacientes_compartilhados
-        ORDER BY total_pacientes_compartilhados DESC, d2.nome ASC
+        MATCH (:Paciente {mongo_id: $paciente_id})-[:DIAGNOSTICADO_COM]->(d:Diagnostico)
+        WITH collect(DISTINCT d) AS origens
+        UNWIND origens AS origem
+        MATCH (destino:Diagnostico)
+        WHERE NOT destino IN origens
+        MATCH caminho = shortestPath((origem)-[:DIAGNOSTICADO_COM*..6]-(destino))
+        WITH destino, origem, caminho
+        ORDER BY length(caminho) ASC, origem.nome ASC
+        WITH destino, collect({origem: origem, caminho: caminho})[0] AS mais_curto
+        WITH destino, mais_curto.origem AS origem, mais_curto.caminho AS caminho
+        RETURN origem.codigo AS diagnostico_origem_codigo,
+               origem.nome AS diagnostico_origem_nome,
+               origem.cid AS diagnostico_origem_cid,
+               destino.codigo AS diagnostico_correlacionado_codigo,
+               destino.nome AS diagnostico_correlacionado_nome,
+               destino.cid AS diagnostico_correlacionado_cid,
+               length(caminho) / 2 AS nivel,
+               [n IN nodes(caminho) WHERE n:Diagnostico | n.nome] AS cadeia
+        ORDER BY nivel ASC, diagnostico_correlacionado_nome ASC
         LIMIT $limite
         """
         return self._executar_leitura(cypher, {"paciente_id": str(paciente_id), "limite": limite})

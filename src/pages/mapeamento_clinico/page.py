@@ -4,12 +4,13 @@ import streamlit.components.v1 as components
 
 from pyvis.network import Network
 
+from config.database import obter_neo4j_repository
 from services.mapeamento_clinico_service import MapeamentoClinicoService
 
 
 @st.cache_resource
 def obter_servico():
-    return MapeamentoClinicoService()
+    return MapeamentoClinicoService(obter_neo4j_repository())
 
 
 def incluir_alergias_no_grafo(dados_grafo):
@@ -156,6 +157,102 @@ def exibir_grafo(dados_grafo):
         html,
         height=620,
         scrolling=True
+    )
+
+
+def exibir_grafo_com_filtros(dados_grafo, chave):
+    """
+    Exibe o grafo com o filtro por tipo de elemento e a legenda.
+    A chave diferencia o filtro de cada grafo da página.
+    """
+
+    # Filtros do grafo
+    st.markdown("#### Filtros do grafo")
+
+    tipos_disponiveis = {
+        "Paciente": "🔵 Paciente",
+        "Medico": "🟢 Médico",
+        "Diagnostico": "🟠 Diagnóstico",
+        "Medicamento": "🟣 Medicamento",
+        "Alergia": "🔴 Alergia"
+    }
+
+    tipos_selecionados = st.multiselect(
+        "Selecione os elementos que deseja visualizar:",
+        options=list(tipos_disponiveis.keys()),
+        default=list(tipos_disponiveis.keys()),
+        format_func=lambda tipo: tipos_disponiveis[tipo],
+        key=f"filtro_grafo_{chave}"
+    )
+
+    # Filtrar os nós
+    nos_filtrados = [
+        no for no in dados_grafo["nodes"]
+        if no.get("type") in tipos_selecionados
+    ]
+
+    # Identificar os IDs dos nós visíveis
+    ids_nos = {
+        no["id"] for no in nos_filtrados
+    }
+
+    # Manter somente relações entre nós visíveis
+    arestas_filtradas = [
+        aresta for aresta in dados_grafo.get("edges", [])
+        if aresta.get("source") in ids_nos
+        and aresta.get("target") in ids_nos
+    ]
+
+    grafo_filtrado = {
+        "nodes": nos_filtrados,
+        "edges": arestas_filtradas
+    }
+
+    if not nos_filtrados:
+        st.info(
+            "Selecione pelo menos um tipo de elemento."
+        )
+        return
+
+    st.write(
+        f"Elementos exibidos: {len(nos_filtrados)}"
+    )
+
+    st.write(
+        f"Relações exibidas: {len(arestas_filtradas)}"
+    )
+
+    # Legenda
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.markdown("🔵 Paciente")
+
+    with col2:
+        st.markdown("🟢 Médico")
+
+    with col3:
+        st.markdown("🟠 Diagnóstico")
+
+    with col4:
+        st.markdown("🟣 Medicamento")
+
+    with col5:
+        st.markdown("🔴 Alergia")
+
+    exibir_grafo(grafo_filtrado)
+
+    st.caption(
+        "Utilize o mouse para movimentar os elementos, "
+        "aproximar e afastar a visualização. "
+        "Passe o cursor sobre os nós para consultar detalhes."
+    )
+
+    st.caption(
+        "As alergias são lidas das propriedades do paciente "
+        "e representadas como nós apenas nesta visualização. "
+        "A ligação POSSUI_ALERGIA é criada pela interface "
+        "e não representa uma relação armazenada no Neo4j."
     )
 
 
@@ -406,12 +503,14 @@ try:
                             "cid_correlacionado", "Não informado"
                         )
 
-                        total = correlacao.get(
-                            "total_pacientes_compartilhados", 0
-                        )
+                        nivel = correlacao.get("nivel", 1)
+
+                        cadeia = correlacao.get("cadeia") or [
+                            origem, relacionado
+                        ]
 
                         with st.expander(
-                            f"{origem} ↔ {relacionado}"
+                            " → ".join(cadeia)
                         ):
                             st.write(
                                 f"**Diagnóstico de origem:** {origem}"
@@ -430,9 +529,15 @@ try:
                             )
 
                             st.metric(
-                                "Pacientes que compartilham os diagnósticos",
-                                total
+                                "Nível na cadeia",
+                                nivel
                             )
+
+                    st.caption(
+                        "Nível 1: outro paciente tem os dois diagnósticos. "
+                        "Nível 2 ou 3: a ligação passa por diagnósticos "
+                        "intermediários, na ordem mostrada na cadeia."
+                    )
 
                     st.caption(
                         "As correlações representam coocorrências "
@@ -465,95 +570,10 @@ try:
                 dados_grafo = incluir_alergias_no_grafo(dados_grafo)
 
                 if dados_grafo.get("nodes"):
-
-                    # Filtros do grafo
-                    st.markdown("#### Filtros do grafo")
-
-                    tipos_disponiveis = {
-                        "Paciente": "🔵 Paciente",
-                        "Medico": "🟢 Médico",
-                        "Diagnostico": "🟠 Diagnóstico",
-                        "Medicamento": "🟣 Medicamento",
-                        "Alergia": "🔴 Alergia"
-                    }
-
-                    tipos_selecionados = st.multiselect(
-                        "Selecione os elementos que deseja visualizar:",
-                        options=list(tipos_disponiveis.keys()),
-                        default=list(tipos_disponiveis.keys()),
-                        format_func=lambda tipo: tipos_disponiveis[tipo],
-                        key=f"filtro_grafo_{paciente_selecionado.get('id')}"
+                    exibir_grafo_com_filtros(
+                        dados_grafo,
+                        paciente_selecionado.get("id")
                     )
-
-                    # Filtrar os nós
-                    nos_filtrados = [
-                        no for no in dados_grafo["nodes"]
-                        if no.get("type") in tipos_selecionados
-                    ]
-
-                    # Identificar os IDs dos nós visíveis
-                    ids_nos = {
-                        no["id"] for no in nos_filtrados
-                    }
-
-                    # Manter somente relações entre nós visíveis
-                    arestas_filtradas = [
-                        aresta for aresta in dados_grafo.get("edges", [])
-                        if aresta.get("source") in ids_nos
-                        and aresta.get("target") in ids_nos
-                    ]
-
-                    grafo_filtrado = {
-                        "nodes": nos_filtrados,
-                        "edges": arestas_filtradas
-                    }
-
-                    if nos_filtrados:
-                        st.write(
-                            f"Elementos exibidos: {len(nos_filtrados)}"
-                        )
-
-                        st.write(
-                            f"Relações exibidas: {len(arestas_filtradas)}"
-                        )
-
-                        # Legenda
-                        col1, col2, col3, col4, col5 = st.columns(5)
-
-                        with col1:
-                            st.markdown("🔵 Paciente")
-
-                        with col2:
-                            st.markdown("🟢 Médico")
-
-                        with col3:
-                            st.markdown("🟠 Diagnóstico")
-
-                        with col4:
-                            st.markdown("🟣 Medicamento")
-
-                        with col5:
-                            st.markdown("🔴 Alergia")
-
-                        exibir_grafo(grafo_filtrado)
-
-                        st.caption(
-                            "Utilize o mouse para movimentar os elementos, "
-                            "aproximar e afastar a visualização. "
-                            "Passe o cursor sobre os nós para consultar detalhes."
-                        )
-
-                        st.caption(
-                            "As alergias são lidas das propriedades do paciente "
-                            "e representadas como nós apenas nesta visualização. "
-                            "A ligação POSSUI_ALERGIA é criada pela interface "
-                            "e não representa uma relação armazenada no Neo4j."
-                        )
-
-                    else:
-                        st.info(
-                            "Selecione pelo menos um tipo de elemento."
-                        )
 
                 else:
                     st.info(
@@ -566,3 +586,31 @@ try:
 
 except Exception as erro:
     st.error(f"Erro ao carregar pacientes: {erro}")
+
+
+st.divider()
+
+
+# Teia de diagnósticos de todos os pacientes
+st.markdown("### Teia de Diagnósticos da Clínica")
+
+st.write(
+    "Visualização de todos os pacientes: os diagnósticos em comum, "
+    "os médicos, os medicamentos e as alergias."
+)
+
+try:
+    grafo_geral = incluir_alergias_no_grafo(
+        servico.obter_grafo_geral()
+    )
+
+    if grafo_geral.get("nodes"):
+        exibir_grafo_com_filtros(grafo_geral, "geral")
+    else:
+        st.info(
+            "Não foram encontradas relações para montar "
+            "a teia de diagnósticos."
+        )
+
+except Exception as erro:
+    st.error(f"Erro ao carregar a teia de diagnósticos: {erro}")

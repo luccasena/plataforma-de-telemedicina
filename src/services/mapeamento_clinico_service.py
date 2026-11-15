@@ -9,11 +9,27 @@ Centraliza a lógica de negócio da Funcionalidade 3:
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from repositories.neo4j_repository import Neo4jRepository, Neo4jError, ServiceUnavailable
 
 logger = logging.getLogger(__name__)
+
+CID_NO_FINAL = re.compile(
+    r"\(\s*CID[\s:-]*(?P<cid>[A-Z]\d{2}(?:\.\d{1,2})?)\s*\)$", re.IGNORECASE
+)
+
+def separar_cid(diagnostico: str) -> Tuple[str, Optional[str]]:
+    texto = diagnostico.strip()
+    encontrado = CID_NO_FINAL.search(texto)
+    if encontrado:
+        return texto[: encontrado.start()].strip(), encontrado["cid"].upper()
+    return texto, None
+
+
+def normalizar_medicamento(nome: str) -> str:
+    return " ".join(nome.split()).capitalize()
 
 
 class MapeamentoClinicoService:
@@ -53,6 +69,119 @@ class MapeamentoClinicoService:
         except Exception as exc:
             logger.error("Erro ao verificar conectividade: %s", exc)
             return {"conectado": False, "mensagem": str(exc)}
+
+    # -------------------------------------------------------------------------
+    # Registro das Consultas no Grafo
+    # -------------------------------------------------------------------------
+
+    def registrar_paciente(self, paciente: Dict[str, Any]) -> None:
+        """
+        Cria ou atualiza o nó (:Paciente) a partir do documento da coleção pacientes.
+        """
+        nascimento = paciente.get("data_nascimento")
+        self.repository.criar_paciente(
+            str(paciente["_id"]),
+            {
+                "nome": paciente.get("nome"),
+                "sexo": paciente.get("sexo"),
+                "data_nascimento": nascimento.date() if nascimento else None,
+                "alergias": paciente.get("alergias", []),
+                "status": paciente.get("status"),
+            },
+        )
+
+    def registrar_medico(self, medico: Dict[str, Any]) -> None:
+        """
+        Cria o nó (:Medico) a partir do id e do nome do médico no PostgreSQL.
+        Os demais dados de um nó que já existe são mantidos.
+        """
+        self.repository.criar_medico(medico["id"], {"nome": medico.get("nome")})
+
+    def registrar_consulta(
+        self, paciente: Dict[str, Any], medico: Dict[str, Any], consulta: Dict[str, Any]
+    ) -> None:
+        """
+        Registra no grafo a consulta criada no prontuário:
+        - os nós (:Paciente) e (:Medico)
+        - (:Medico)-[:ATENDEU]->(:Paciente), com a queixa principal e os sintomas
+        - (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico) para cada diagnóstico
+
+        Os erros do Neo4j são repassados para quem chamou, que decide como avisar o usuário.
+
+        :param paciente: Documento do paciente na coleção pacientes.
+        :param medico: Dicionário com o id e o nome do médico.
+        :param consulta: Consulta gravada no prontuário.
+        """
+        paciente_id = str(paciente["_id"])
+        consulta_id = str(consulta["_id"])
+
+        self.registrar_paciente(paciente)
+        self.registrar_medico(medico)
+        self.repository.criar_atendimento(
+            medico["id"],
+            paciente_id,
+            consulta_id,
+            consulta.get("queixa_principal"),
+            consulta.get("sintomas", []),
+        )
+        self._registrar_diagnosticos(
+            paciente_id, consulta_id, medico["id"], consulta.get("diagnosticos", [])
+        )
+
+    def atualizar_diagnosticos(
+        self,
+        paciente: Dict[str, Any],
+        consulta_id: Any,
+        medico_id: int,
+        diagnosticos: List[str],
+    ) -> None:
+        """
+        Troca no grafo os diagnósticos da consulta pelos editados no prontuário.
+
+        :param paciente: Documento do paciente na coleção pacientes.
+        :param consulta_id: Id da consulta no prontuário.
+        :param medico_id: Id do médico da consulta na tabela usuarios.
+        :param diagnosticos: Nova lista de diagnósticos da consulta.
+        """
+        paciente_id = str(paciente["_id"])
+
+        self.registrar_paciente(paciente)
+        self.repository.remover_diagnosticos_consulta(paciente_id, str(consulta_id))
+        self._registrar_diagnosticos(paciente_id, str(consulta_id), medico_id, diagnosticos)
+
+    def registrar_prescricoes(
+        self, paciente: Dict[str, Any], consulta_id: Any, prescricoes: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Registra no grafo as prescrições da consulta finalizada:
+        (:Paciente)-[:RECEBEU_PRESCRICAO]->(:Medicamento) para cada medicamento.
+        Os alertas de segurança passam a considerar esses medicamentos.
+
+        :param paciente: Documento do paciente na coleção pacientes.
+        :param consulta_id: Id da consulta no prontuário.
+        :param prescricoes: Prescrições com nome, dosagem, frequência e orientações.
+        """
+        paciente_id = str(paciente["_id"])
+
+        self.registrar_paciente(paciente)
+        for prescricao in prescricoes:
+            self.repository.criar_prescricao(
+                paciente_id,
+                str(consulta_id),
+                normalizar_medicamento(prescricao["nome"]),
+                prescricao.get("dosagem"),
+                prescricao.get("frequencia"),
+                prescricao.get("orientacoes"),
+            )
+
+    def _registrar_diagnosticos(
+        self, paciente_id: str, consulta_id: str, medico_id: int, diagnosticos: List[str]
+    ) -> None:
+        for diagnostico in diagnosticos:
+            nome, cid = separar_cid(diagnostico)
+            self.repository.criar_diagnostico(
+                paciente_id, consulta_id, medico_id, cid or nome, nome, cid
+            )
 
     # -------------------------------------------------------------------------
     # Listagem de Pacientes
@@ -182,7 +311,7 @@ class MapeamentoClinicoService:
                 if not medico:
                     continue
 
-                m_raw_id = medico.get("mongo_id") or medico.get("id")
+                m_raw_id = medico.get("postgres_id")
                 m_id = f"medico_{m_raw_id}" if m_raw_id else f"medico_{medico.get('crm', 'desconhecido')}"
                 if m_id not in nos_map:
                     nos_map[m_id] = {
@@ -323,7 +452,7 @@ class MapeamentoClinicoService:
                     rel = item.get("rel")
                     if not medico:
                         continue
-                    m_raw_id = medico.get("mongo_id") or medico.get("id")
+                    m_raw_id = medico.get("postgres_id")
                     m_id = f"medico_{m_raw_id}" if m_raw_id else f"medico_{medico.get('crm', 'desconhecido')}"
                     if m_id not in nos_map:
                         nos_map[m_id] = {
@@ -429,8 +558,9 @@ class MapeamentoClinicoService:
     ) -> List[Dict[str, Any]]:
         """
         Identifica diagnósticos correlacionados no grafo com base na coocorrência epidemiológica
-        entre os pacientes da base. Se um paciente_id for informado, busca correlações específicas
-        aos diagnósticos daquele paciente. Caso contrário, retorna os diagnósticos mais correlacionados
+        entre os pacientes da base. Se um paciente_id for informado, segue em cadeia (até 3 níveis)
+        as correlações a partir dos diagnósticos daquele paciente; cada item traz o nível e a
+        cadeia de diagnósticos. Caso contrário, retorna os diagnósticos mais correlacionados
         da base geral.
 
         :param paciente_id: Opcional. mongo_id do paciente de referência.
@@ -448,7 +578,8 @@ class MapeamentoClinicoService:
                             "cid_origem": item.get("diagnostico_origem_cid"),
                             "diagnostico_correlacionado": item.get("diagnostico_correlacionado_nome"),
                             "cid_correlacionado": item.get("diagnostico_correlacionado_cid"),
-                            "total_pacientes_compartilhados": item.get("total_pacientes_compartilhados", 0),
+                            "nivel": item.get("nivel", 1),
+                            "cadeia": item.get("cadeia") or [],
                         }
                     )
                 return resultado

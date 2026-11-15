@@ -1,21 +1,35 @@
+from datetime import date, datetime, time, timedelta, timezone
+
 import streamlit as st
+from neo4j.exceptions import Neo4jError, ServiceUnavailable
+from psycopg import Error as PostgresError
 from pymongo.errors import PyMongoError
+from redis.exceptions import RedisError
 from services.paciente_service import PacienteService
-from config.database import obter_mongo_repository
+from config.database import (
+    conectar_redis,
+    obter_mongo_repository,
+    obter_neo4j_repository,
+    obter_postgres_repository,
+)
+from services.agenda_cache_service import FUSO_BRASILIA, AgendaCacheService
 from services.prontuario_service import ProntuarioService
 from services.usuario_service import UsuarioService
 
 mongo_repository = obter_mongo_repository()
+agenda_cache_service = AgendaCacheService(conectar_redis(), mongo_repository)
 paciente_service = PacienteService(mongo_repository)
-prontuario_service = ProntuarioService(mongo_repository)
-usuario_service = UsuarioService(mongo_repository)
+usuario_service = UsuarioService(obter_postgres_repository(), mongo_repository)
+prontuario_service = ProntuarioService(
+    mongo_repository, usuario_service, obter_neo4j_repository()
+)
 
 @st.dialog("Criar consulta")
 def _criar_consulta_modal():
     try:
         medicos = usuario_service.obter_medicos()
         pacientes = paciente_service.obter_pacientes()
-    except PyMongoError:
+    except (PyMongoError, PostgresError):
         st.error("Não foi possível carregar os usuários.")
         return
 
@@ -46,10 +60,19 @@ def _criar_consulta_modal():
         st.warning("Nenhum médico ativo cadastrado.")
         return
     opcoes_medicos = {
-        f"{medico['nome']} - CRM: {medico.get('crm', 'não informado')}": medico["_id"]
+        f"{medico['nome']} - CRM: {medico.get('crm', 'não informado')}": medico["id"]
         for medico in medicos
     }
     medico_id = opcoes_medicos[st.selectbox("Médico responsável", list(opcoes_medicos))]
+    col_data, col_horario = st.columns(2)
+    with col_data:
+        data_consulta = st.date_input(
+            "Data da consulta", value=date.today(), min_value=date.today()
+        )
+    with col_horario:
+        horario_consulta = st.time_input(
+            "Horário", value=time(9, 0), step=timedelta(minutes=30)
+        )
     queixa_principal = st.text_input("Queixa principal")
     sintomas = st.text_area("Sintomas", help="Informe um sintoma por linha.")
     diagnosticos = st.text_area(
@@ -62,6 +85,12 @@ def _criar_consulta_modal():
         return
     if not queixa_principal.strip():
         st.error("Informe a queixa principal.")
+        return
+    horario_inicio = datetime.combine(
+        data_consulta, horario_consulta, tzinfo=FUSO_BRASILIA
+    )
+    if horario_inicio < datetime.now(timezone.utc):
+        st.error("Escolha um horário que ainda não passou.")
         return
     if origem_paciente == "Criar novo paciente":
         if not all(campo.strip() for campo in [nome, cpf, email]) or telefone <= 0:
@@ -78,20 +107,55 @@ def _criar_consulta_modal():
             st.error("Não foi possível criar o paciente.")
             return
 
+    _salvar_consulta(
+        paciente_id,
+        medico_id,
+        horario_inicio,
+        queixa_principal.strip(),
+        [item.strip() for item in sintomas.splitlines() if item.strip()],
+        [item.strip() for item in diagnosticos.splitlines() if item.strip()],
+        observacoes.strip(),
+    )
+
+def _salvar_consulta(
+    paciente_id,
+    medico_id,
+    horario_inicio,
+    queixa_principal,
+    sintomas,
+    diagnosticos,
+    observacoes,
+):
+    avisos = []
     try:
         prontuario_service.criar_consulta(
             paciente_id,
             medico_id,
-            queixa_principal.strip(),
-            [item.strip() for item in sintomas.splitlines() if item.strip()],
-            [item.strip() for item in diagnosticos.splitlines() if item.strip()],
-            observacoes.strip(),
+            horario_inicio,
+            queixa_principal,
+            sintomas,
+            diagnosticos,
+            observacoes,
         )
-    except PyMongoError:
+    except (PyMongoError, PostgresError):
         st.error("Não foi possível criar a consulta.")
         return
+    except (Neo4jError, ServiceUnavailable):
+        avisos.append("o Mapeamento Clínico")
 
-    st.success("Consulta criada com status Agendado.")
+    try:
+        agenda_cache_service.invalidar_agenda_dia(medico_id, horario_inicio.date())
+    except RedisError:
+        avisos.append("a agenda do dia")
+
+    if avisos:
+        st.toast(
+            "Consulta criada, mas não foi possível atualizar "
+            f"{' e '.join(avisos)}."
+        )
+    else:
+        st.toast("Consulta criada com status Agendado.")
+
     st.rerun()
 
 def _atualizar_diagnosticos(paciente_id, consulta_id, diagnosticos):
@@ -109,12 +173,18 @@ def _atualizar_diagnosticos(paciente_id, consulta_id, diagnosticos):
     except PyMongoError:
         st.error("Não foi possível atualizar os diagnósticos.")
         return
+    except (Neo4jError, ServiceUnavailable):
+        st.toast(
+            "Diagnósticos atualizados, mas não foi possível atualizar o "
+            "Mapeamento Clínico."
+        )
+        st.rerun()
 
     if not atualizado:
         st.error("A consulta não foi encontrada para atualização.")
         return
 
-    st.success("Diagnósticos atualizados.")
+    st.toast("Diagnósticos atualizados.")
     st.rerun()
 
 def _atualizar_anexo(paciente_id, consulta_id, arquivo):
@@ -136,7 +206,9 @@ def _atualizar_anexo(paciente_id, consulta_id, arquivo):
     if not atualizado:
         st.error("O prontuário não foi encontrado para atualização.")
         return
-
+    
+    chave_versao = f"versao_anexo_{consulta_id}"
+    st.session_state[chave_versao] = st.session_state.get(chave_versao, 0) + 1
     st.success("Documento anexado.")
     st.rerun()
 
@@ -158,10 +230,11 @@ def _exibir_consulta(paciente_id, consulta, numero):
         if salvar:
             _atualizar_diagnosticos(paciente_id, consulta["_id"], diagnosticos)
 
+        versao_anexo = st.session_state.get(f"versao_anexo_{consulta['_id']}", 0)
         arquivo = st.file_uploader(
             "Anexar documento PDF",
             type=["pdf"],
-            key=f"anexo_{consulta['_id']}",
+            key=f"anexo_{consulta['_id']}_{versao_anexo}",
             help="Tamanho máximo: 16 MB, conforme o limite do MongoDB.",
         )
         if arquivo is not None and st.button(
@@ -185,6 +258,8 @@ def _exibir_consulta(paciente_id, consulta, numero):
                 st.warning("O documento foi cadastrado, mas não está disponível.")
 
         st.write(f"**Observações:** {consulta.get('observacoes', '-')}")
+        if consulta.get("receita"):
+            st.write(f"**Receita:** {consulta['receita']}")
 
 def exibir_historico():
     st.subheader("Atendimento Médico - Histórico de Consultas")
@@ -242,5 +317,25 @@ def exibir_historico():
 
     for numero, consulta in enumerate(consultas, start=1):
         _exibir_consulta(paciente_id, consulta, numero)
+
+    st.write("**Prescrições do paciente**")
+    prescricoes = prontuario.get("prescricoes", [])
+    if not prescricoes:
+        st.info("Nenhuma prescrição registrada.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Medicamento": prescricao.get("nome"),
+                "Dosagem": prescricao.get("dosagem") or "-",
+                "Frequência": prescricao.get("frequencia") or "-",
+                "Orientações": prescricao.get("orientacoes") or "-",
+            }
+            for prescricao in prescricoes
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 exibir_historico()
