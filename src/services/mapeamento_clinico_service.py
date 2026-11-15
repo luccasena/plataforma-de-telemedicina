@@ -558,8 +558,9 @@ class MapeamentoClinicoService:
     ) -> List[Dict[str, Any]]:
         """
         Identifica diagnósticos correlacionados no grafo com base na coocorrência epidemiológica
-        entre os pacientes da base. Se um paciente_id for informado, busca correlações específicas
-        aos diagnósticos daquele paciente. Caso contrário, retorna os diagnósticos mais correlacionados
+        entre os pacientes da base. Se um paciente_id for informado, segue em cadeia (até 3 níveis)
+        as correlações a partir dos diagnósticos daquele paciente; cada item traz o nível e a
+        cadeia de diagnósticos. Caso contrário, retorna os diagnósticos mais correlacionados
         da base geral.
 
         :param paciente_id: Opcional. mongo_id do paciente de referência.
@@ -577,7 +578,8 @@ class MapeamentoClinicoService:
                             "cid_origem": item.get("diagnostico_origem_cid"),
                             "diagnostico_correlacionado": item.get("diagnostico_correlacionado_nome"),
                             "cid_correlacionado": item.get("diagnostico_correlacionado_cid"),
-                            "total_pacientes_compartilhados": item.get("total_pacientes_compartilhados", 0),
+                            "nivel": item.get("nivel", 1),
+                            "cadeia": item.get("cadeia") or [],
                         }
                     )
                 return resultado

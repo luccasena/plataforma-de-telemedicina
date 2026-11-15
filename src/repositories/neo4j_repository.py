@@ -405,23 +405,35 @@ class Neo4jRepository:
 
     def buscar_diagnosticos_correlacionados_paciente(self, paciente_id: str, limite: int = 10) -> List[Dict[str, Any]]:
         """
-        Identifica diagnósticos correlacionados aos diagnósticos do paciente especificado,
-        baseando-se na coocorrência epidemiológica entre outros pacientes no grafo.
+        Identifica, em cadeia, os diagnósticos correlacionados aos do paciente.
+
+        Dois diagnósticos se correlacionam quando algum paciente tem os dois. A busca
+        segue essas ligações pelo caminho mais curto, (:Diagnostico)<-[:DIAGNOSTICADO_COM]-
+        (:Paciente)-[:DIAGNOSTICADO_COM]->(:Diagnostico), por até 3 níveis
+        (*..6 relacionamentos). Nível 1 é a ligação direta; no nível 2, a cadeia passa
+        por um diagnóstico intermediário, e assim por diante. Diagnósticos que o
+        paciente já tem não entram no resultado.
         """
         cypher = """
-        MATCH (p:Paciente {mongo_id: $paciente_id})-[:DIAGNOSTICADO_COM]->(d1:Diagnostico)
-        MATCH (outro:Paciente)-[:DIAGNOSTICADO_COM]->(d1)
-        MATCH (outro)-[:DIAGNOSTICADO_COM]->(d2:Diagnostico)
-        WHERE d1.codigo <> d2.codigo
-        WITH d1, d2, count(DISTINCT outro) AS total_pacientes_compartilhados
-        RETURN d1.codigo AS diagnostico_origem_codigo,
-               d1.nome AS diagnostico_origem_nome,
-               d1.cid AS diagnostico_origem_cid,
-               d2.codigo AS diagnostico_correlacionado_codigo,
-               d2.nome AS diagnostico_correlacionado_nome,
-               d2.cid AS diagnostico_correlacionado_cid,
-               total_pacientes_compartilhados
-        ORDER BY total_pacientes_compartilhados DESC, d2.nome ASC
+        MATCH (:Paciente {mongo_id: $paciente_id})-[:DIAGNOSTICADO_COM]->(d:Diagnostico)
+        WITH collect(DISTINCT d) AS origens
+        UNWIND origens AS origem
+        MATCH (destino:Diagnostico)
+        WHERE NOT destino IN origens
+        MATCH caminho = shortestPath((origem)-[:DIAGNOSTICADO_COM*..6]-(destino))
+        WITH destino, origem, caminho
+        ORDER BY length(caminho) ASC, origem.nome ASC
+        WITH destino, collect({origem: origem, caminho: caminho})[0] AS mais_curto
+        WITH destino, mais_curto.origem AS origem, mais_curto.caminho AS caminho
+        RETURN origem.codigo AS diagnostico_origem_codigo,
+               origem.nome AS diagnostico_origem_nome,
+               origem.cid AS diagnostico_origem_cid,
+               destino.codigo AS diagnostico_correlacionado_codigo,
+               destino.nome AS diagnostico_correlacionado_nome,
+               destino.cid AS diagnostico_correlacionado_cid,
+               length(caminho) / 2 AS nivel,
+               [n IN nodes(caminho) WHERE n:Diagnostico | n.nome] AS cadeia
+        ORDER BY nivel ASC, diagnostico_correlacionado_nome ASC
         LIMIT $limite
         """
         return self._executar_leitura(cypher, {"paciente_id": str(paciente_id), "limite": limite})

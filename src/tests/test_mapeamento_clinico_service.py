@@ -14,14 +14,18 @@ def medico(postgres_id, nome, crm, uf_crm):
 
 
 class Neo4jRepositoryFake:
-    def __init__(self, linha):
+    def __init__(self, linha, correlacoes=()):
         self.linha = linha
+        self.correlacoes = list(correlacoes)
 
     def buscar_subgrafo_paciente(self, paciente_id):
         return self.linha
 
     def buscar_grafo_geral(self, limite):
         return {"linhas": [self.linha]}
+
+    def buscar_diagnosticos_correlacionados_paciente(self, paciente_id, limite):
+        return self.correlacoes
 
 
 class MapeamentoClinicoServiceTests(unittest.TestCase):
@@ -55,6 +59,35 @@ class MapeamentoClinicoServiceTests(unittest.TestCase):
     def test_grafo_geral_identifica_medicos_pelo_id_do_postgres(self):
         self.verificar_medicos(self.service.obter_grafo_geral())
 
+    def test_correlacoes_do_paciente_trazem_nivel_e_cadeia(self):
+        repositorio = Neo4jRepositoryFake(
+            {},
+            [
+                {
+                    "diagnostico_origem_nome": "Enxaqueca",
+                    "diagnostico_origem_cid": "G43.0",
+                    "diagnostico_correlacionado_nome": "Rinite alérgica",
+                    "diagnostico_correlacionado_cid": "J30.4",
+                    "nivel": 2,
+                    "cadeia": ["Enxaqueca", "Asma", "Rinite alérgica"],
+                }
+            ],
+        )
+        servico = MapeamentoClinicoService(repositorio)
+
+        self.assertEqual(
+            servico.identificar_diagnosticos_correlacionados("p1"),
+            [
+                {
+                    "diagnostico_origem": "Enxaqueca",
+                    "cid_origem": "G43.0",
+                    "diagnostico_correlacionado": "Rinite alérgica",
+                    "cid_correlacionado": "J30.4",
+                    "nivel": 2,
+                    "cadeia": ["Enxaqueca", "Asma", "Rinite alérgica"],
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":
