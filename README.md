@@ -20,19 +20,6 @@ Os dados ficam em quatro bancos, cada um escolhido pelo tipo de dado que guarda:
 - Lucca de Sena Barbosa
 - Ryan Emanuel Lima Miranda
 
-## Sumário
-
-- [Funcionalidades](#funcionalidades)
-- [Persistência poliglota](#persistência-poliglota)
-- [Como executar](#como-executar)
-- [Estrutura do projeto](#estrutura-do-projeto)
-- [PostgreSQL: usuários e acesso](#postgresql-usuários-e-acesso)
-- [MongoDB: médicos, pacientes, prontuários e agendamentos](#mongodb-médicos-pacientes-prontuários-e-agendamentos)
-- [Recepção Virtual: fila e agenda](#recepção-virtual-fila-e-agenda)
-- [Finalização de Consultas](#finalização-de-consultas)
-- [Mapeamento Clínico e alertas de segurança (Neo4j)](#mapeamento-clínico-e-alertas-de-segurança-neo4j)
-- [Redis: fila de espera e sessões](#redis-fila-de-espera-e-sessões)
-
 ## Funcionalidades
 
 | Tela | O que faz | Bancos usados |
