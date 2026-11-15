@@ -10,6 +10,7 @@ from config.database import (
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
+from services.sessao_service import SessaoService
 from services.usuario_service import UsuarioService
 
 mongo_repository = obter_mongo_repository()
@@ -19,6 +20,7 @@ prontuario_service = ProntuarioService(
 )
 fila_service = FilaService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
+sessao_service = SessaoService(redis_client)
 
 def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
     if arquivo is None:
@@ -48,9 +50,11 @@ def _finalizar_consulta(paciente_id, consulta_id, arquivo, receita):
     try:
         fila_service.remover_da_fila(consulta_id)
         agenda_cache_service.invalidar_agendas_da_consulta(consulta_id)
+        sessao_service.revogar_sessao_consulta(consulta_id)
     except (RedisError, PyMongoError):
         st.toast(
-            "Consulta finalizada, mas não foi possível atualizar a fila e a agenda."
+            "Consulta finalizada, mas não foi possível atualizar a fila, "
+            "a agenda e a sessão da consulta."
         )
     else:
         st.toast("Consulta finalizada com status Concluído.")

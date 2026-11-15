@@ -15,6 +15,7 @@ from config.database import (
 from services.agenda_cache_service import AgendaCacheService
 from services.fila_service import FilaService
 from services.prontuario_service import ProntuarioService
+from services.sessao_service import SessaoService
 from services.usuario_service import UsuarioService
 
 
@@ -22,6 +23,7 @@ FUSO_BRASILIA = timezone(timedelta(hours=-3))
 mongo_repository = obter_mongo_repository()
 redis_client = conectar_redis()
 fila_service = FilaService(redis_client)
+sessao_service = SessaoService(redis_client)
 agenda_cache_service = AgendaCacheService(redis_client, mongo_repository)
 usuario_service = UsuarioService(obter_postgres_repository(), mongo_repository)
 prontuario_service = ProntuarioService(mongo_repository, usuario_service)
@@ -109,9 +111,13 @@ def _chamar_proximo():
         return
 
     try:
+        sessao_service.criar_sessao_consulta(proximo["consulta_id"])
         agenda_cache_service.invalidar_agendas_da_consulta(consulta_id)
     except (PyMongoError, RedisError):
-        st.toast("Consulta iniciada, mas não foi possível atualizar a agenda do dia.")
+        st.toast(
+            "Consulta iniciada, mas não foi possível criar a sessão da consulta "
+            "ou atualizar a agenda do dia."
+        )
 
     st.toast(f"Paciente chamado: {paciente_nome}. Consulta em andamento.")
     st.rerun()
@@ -195,9 +201,16 @@ def _exibir_consultas_ativas():
         st.info("Não há consultas em atendimento.")
         return
     for consulta in consultas:
+        sessao = sessao_service.obter_sessao_consulta(consulta["consulta_id"])
+        if sessao is None:
+            descricao_sessao = "sessão expirada"
+        else:
+            descricao_sessao = (
+                f"token da sessão `{sessao['token']}`, "
+                f"expira em {sessao['expira_em'] // 60} min"
+            )
         st.write(
-            f"**{consulta.get('paciente_nome', 'Paciente')}** "
-            f"— sessão {consulta['consulta_id'][:8]}"
+            f"**{consulta.get('paciente_nome', 'Paciente')}** — {descricao_sessao}"
         )
 
 
