@@ -34,14 +34,7 @@ Os dados ficam em quatro bancos, cada um escolhido pelo tipo de dado que guarda:
 
 O projeto divide os dados da seguinte forma:
 
-```mermaid
-flowchart LR
-    UI["Telas Streamlit"] --> S["Serviços<br/>(src/services)"]
-    S --> PG[("PostgreSQL<br/>usuários e acesso")]
-    S --> MG[("MongoDB<br/>pacientes, prontuários,<br/>agendamentos, médicos")]
-    S --> RD[("Redis<br/>fila, sessões e cache")]
-    S --> NJ[("Neo4j<br/>grafo clínico")]
-```
+<img src="img/persistencia-poliglota.png"></img>
 
 ### O papel de cada banco
 
