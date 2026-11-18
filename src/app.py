@@ -53,27 +53,32 @@ def exibir_aplicacao():
     home_page = st.Page(
         "pages/home/page.py",
         title="Página Inicial",
+        icon=":material/home:",
         url_path="home",
     )
 
     atendimento_medico_page = st.Page(
         "pages/atendimento_medico/page.py",
         title="Atendimento Médico",
+        icon=":material/stethoscope:",
         url_path="atendimento-medico",
     )
     consultas_page = st.Page(
         "pages/finalizacao_consultas/page.py",
         title="Consultas",
+        icon=":material/assignment_turned_in:",
         url_path="consultas",
     )
     mapeamento_page = st.Page(
         "pages/mapeamento_clinico/page.py",
         title="Mapeamento Clínico",
+        icon=":material/hub:",
         url_path="mapeamento-clinico",
     )
     recepcao_page = st.Page(
         "pages/recepcao_virtual/page.py",
         title="Recepção Virtual",
+        icon=":material/support_agent:",
         url_path="recepcao-virtual",
     )
 
